@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TheoReminder</title>
+<meta name="description" content="Agenda personale incarichi congregazione - Matteo Piano">
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#2563eb">
+<link rel="apple-touch-icon" href="./icons/icon-192.png">
+<link rel="icon" href="./icons/icon-192.png">
+
+<!-- FullCalendar CSS+JS via cdnjs -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/fullcalendar/6.1.11/index.global.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/fullcalendar/6.1.11/index.global.min.js" defer></script>
+<!-- FullCalendar locale italiano -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/fullcalendar/6.1.11/locales/it.global.min.js" defer></script>
+<!-- pdf.js via cdnjs (3.11.174: ultima versione con build UMD classico pdf.min.js) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" defer></script>
+
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<header class="app-header">
+  <h1>📖 TheoReminder</h1>
+</header>
+
+<main>
+
+  <!-- ============ DASHBOARD ============ -->
+  <section id="view-dashboard" class="view active">
+    <h2>Dashboard</h2>
+
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <span class="stat-value" id="stat-year-total">0</span>
+        <span class="stat-label">Incarichi anno corrente</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-value" id="stat-top-role">—</span>
+        <span class="stat-label">Ruolo più frequente</span>
+      </div>
+    </div>
+
+    <div id="conflict-warning-wrap" class="hidden">
+      <div class="card conflict-card">
+        <h3>⚠️ Incarichi nello stesso giorno</h3>
+        <div id="conflict-list"></div>
+      </div>
+    </div>
+
+    <div class="section-title">
+      <h3>Prossimi incarichi</h3>
+    </div>
+    <div id="upcoming-list"></div>
+  </section>
+
+  <!-- ============ CARICA PDF ============ -->
+  <section id="view-upload" class="view">
+    <h2>Carica PDF</h2>
+    <p>Carica uno o più programmi in PDF: il testo verrà estratto e verranno cercate automaticamente le righe con il cognome "Piano".</p>
+
+    <div class="upload-box" id="pdf-drop-zone">
+      <input type="file" id="pdfInput" accept="application/pdf" multiple>
+      <p class="small-text" style="margin-top:8px;">Trascina qui uno o più PDF, oppure scegli i file dal telefono o dal computer</p>
+    </div>
+
+    <div id="pdf-status" class="small-text hidden"></div>
+
+    <div id="pdf-preview-wrap" class="hidden">
+      <div class="section-title"><h3>Testo estratto</h3></div>
+      <textarea class="pdf-preview" id="pdf-preview" readonly></textarea>
+    </div>
+
+    <div id="assignments-wrap" class="hidden">
+      <div class="section-title"><h3>Incarichi trovati</h3></div>
+      <p class="small-text">Correggi data/ora/ruolo se necessario, poi salva ogni riga nel calendario.</p>
+      <div id="assignments-list"></div>
+    </div>
+  </section>
+
+  <!-- ============ CALENDARIO ============ -->
+  <section id="view-calendar" class="view">
+    <h2>Calendario</h2>
+    <div id="calendar"></div>
+  </section>
+
+  <!-- ============ STATISTICHE ============ -->
+  <section id="view-stats" class="view">
+    <h2>Statistiche</h2>
+
+    <div class="stat-grid">
+      <div class="stat-tile">
+        <span class="stat-value" id="stats-total">0</span>
+        <span class="stat-label">Totale incarichi</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-value" id="stats-year">0</span>
+        <span class="stat-label">Anno corrente</span>
+      </div>
+    </div>
+
+    <div class="section-title"><h3>Incarichi per mese</h3></div>
+    <div class="card">
+      <div class="bar-chart" id="stats-by-month"></div>
+    </div>
+
+    <div class="section-title"><h3>Incarichi per ruolo</h3></div>
+    <div class="card">
+      <div class="bar-chart" id="stats-by-role"></div>
+    </div>
+  </section>
+
+  <!-- ============ IMPOSTAZIONI ============ -->
+  <section id="view-settings" class="view">
+    <h2>Impostazioni</h2>
+
+    <div class="card">
+      <h3>Notifiche</h3>
+      <p>Ricevi un promemoria prima di ogni incarico.</p>
+      <button class="btn-primary" id="enable-notifications-btn">🔔 Attiva notifiche</button>
+      <p class="small-text" id="notification-status" style="margin-top:8px;"></p>
+    </div>
+
+    <div class="card">
+      <h3>Esportazione</h3>
+      <button class="btn-secondary btn-block" id="export-csv-btn">⬇️ Esporta i miei incarichi (CSV)</button>
+    </div>
+
+    <div class="card">
+      <h3>Dati</h3>
+      <button class="btn-danger btn-block" id="clear-data-btn">🗑️ Cancella tutti i dati</button>
+    </div>
+
+    <p class="small-text" style="text-align:center;margin-top:12px;">TheoReminder — agenda personale, nessun dato lascia questo dispositivo.</p>
+  </section>
+
+</main>
+
+<!-- Bottom nav -->
+<nav class="bottom-nav">
+  <button class="nav-btn active" data-nav-target="view-dashboard"><span class="nav-icon">🏠</span>Dashboard</button>
+  <button class="nav-btn" data-nav-target="view-upload"><span class="nav-icon">📄</span>Carica PDF</button>
+  <button class="nav-btn" data-nav-target="view-calendar"><span class="nav-icon">📅</span>Calendario</button>
+  <button class="nav-btn" data-nav-target="view-stats"><span class="nav-icon">📊</span>Statistiche</button>
+  <button class="nav-btn" data-nav-target="view-settings"><span class="nav-icon">⚙️</span>Impostazioni</button>
+</nav>
+
+<!-- Modifica incarico: si apre cliccando un evento nel calendario, o trascinandolo su un'altra data -->
+<div class="modal-overlay hidden" id="event-modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3>Modifica incarico</h3>
+      <button class="btn-icon" id="modal-close-btn" aria-label="Chiudi">✖</button>
+    </div>
+
+    <label for="modal-title-input">Ruolo / incarico</label>
+    <input type="text" id="modal-title-input" placeholder="Ruolo o incarico">
+
+    <label for="modal-date-input">Data</label>
+    <input type="date" id="modal-date-input">
+
+    <label for="modal-time-input">Ora</label>
+    <input type="time" id="modal-time-input">
+
+    <label for="modal-desc-input">Note</label>
+    <textarea id="modal-desc-input" placeholder="Dettagli aggiuntivi (opzionale)"></textarea>
+
+    <label for="modal-reminder-input">Promemoria</label>
+    <select id="modal-reminder-input">
+      <option value="none">Nessuno</option>
+      <option value="3days">3 giorni prima</option>
+      <option value="1day">1 giorno prima</option>
+      <option value="custom">Personalizzato</option>
+    </select>
+    <input type="number" id="modal-reminder-custom-days" placeholder="Giorni prima" class="hidden" style="margin-top:8px;" min="1">
+
+    <button class="btn-primary btn-block" style="margin-top:14px;" id="modal-save-btn">💾 Salva modifiche</button>
+    <button class="btn-danger btn-block" id="modal-delete-btn">🗑️ Elimina incarico</button>
+  </div>
+</div>
+
+<!-- Lightbox per ingrandire l'anteprima ritagliata dal PDF -->
+<div class="modal-overlay hidden" id="image-lightbox">
+  <div class="lightbox-box">
+    <button class="btn-icon lightbox-close" id="lightbox-close-btn" aria-label="Chiudi">✖</button>
+    <img id="lightbox-img" alt="Estratto del PDF ingrandito">
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="./app.js"></script>
+</body>
+</html>

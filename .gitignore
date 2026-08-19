@@ -1,0 +1,10 @@
+# PDF di esempio reali (contengono nomi di persone della congregazione): mai pubblicare.
+sample_pdfs/
+
+# File esportati durante i test locali (scaricati per errore nella cartella del progetto)
+theoreminder-incarichi.csv
+theoreminder-incarichi.ics
+
+# File di sistema
+.DS_Store
+Thumbs.db
