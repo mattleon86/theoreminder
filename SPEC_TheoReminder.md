@@ -171,7 +171,19 @@ Niente più `theme`: l'app ha solo il tema chiaro, nessuna opzione di aspetto.
 - Prossimi 3-5 incarichi (ordinati per data/ora, solo futuri).
 - Totale incarichi anno corrente.
 - Ruolo più frequente.
-- Bottoni rapidi: Carica PDF, Vai al calendario, Esporta CSV.
+- Avviso "⚠️ Incarichi nello stesso giorno" se due o più incarichi cadono sulla stessa data (stesso controllo scatta anche come toast subito dopo aver salvato un incarico che crea il conflitto).
+- Nessun pulsante di azione rapida (rimossi su richiesta dell'utente).
+
+### 8. Modifica incarichi dal calendario
+- Click su un incarico → popup di modifica completo (ruolo, data, ora, note, promemoria), non solo visualizzazione.
+- Trascinamento (drag & drop, o "tieni premuto" su touch) di un incarico su un'altra data → si apre lo stesso popup con la nuova data già impostata, da confermare o correggere. Se il popup si chiude senza salvare, l'incarico torna alla data originale.
+- Se data/ora/promemoria cambiano, `reminderFired` si resetta (il promemoria può scattare di nuovo); se cambia solo il testo, resta invariato.
+
+### 9. Lucchetto (password)
+- Il repository GitHub è **pubblico** (necessario per GitHub Pages gratuito): questa protezione **non è vera sicurezza**, serve solo a tenere fuori i visitatori casuali. Chi legge il codice sorgente pubblico può risalire, con lavoro, alla password.
+- All'apertura, se `localStorage.tr_unlocked !== 'true'`, viene mostrata una schermata a schermo intero con richiesta password (hash SHA-256 confrontato con un valore fisso in `app.js`), prima che il resto della pagina sia visibile (nessun "lampeggio" di contenuto).
+- Password corretta → `tr_unlocked` salvato in `localStorage`: il dispositivo resta sbloccato finché non si cancellano i dati del sito o non si usa un browser/dispositivo diverso.
+- In Impostazioni → Sicurezza: pulsante "Blocca subito l'app" per ribloccare manualmente (es. prima di prestare il telefono).
 
 ## Decisioni prese dopo i primi test (19/08/2026)
 Dopo aver testato l'app con i PDF reali, l'utente ha chiesto e ottenuto queste modifiche rispetto alla v1 iniziale:

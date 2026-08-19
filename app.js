@@ -8,6 +8,59 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
+     LUCCHETTO INIZIALE (password)
+     Protezione semplice: il repository è pubblico (necessario per GitHub Pages gratuito),
+     quindi questa NON è vera sicurezza — chi legge il codice sorgente può trovare l'hash e,
+     con lavoro, risalire alla password. Serve a tenere fuori i visitatori casuali.
+     Una volta sbloccato, il dispositivo se lo ricorda (localStorage) e non richiede più la
+     password finché non si cancellano i dati del sito o non si usa un altro browser/dispositivo.
+     --------------------------------------------------------------------- */
+  const LOCK_PASSWORD_HASH = '1b398435e9926210065809fa1ff91a10bd4bffc4f71a13497ea7a88d136f2a61';
+  const UNLOCK_STORAGE_KEY = 'tr_unlocked';
+
+  async function sha256Hex(text) {
+    const bytes = new TextEncoder().encode(text);
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function initLockScreen() {
+    const input = document.getElementById('lock-password-input');
+    const btn = document.getElementById('lock-submit-btn');
+    const errorEl = document.getElementById('lock-error');
+    if (!input || !btn) return;
+
+    async function tryUnlock() {
+      const value = input.value;
+      if (!value) return;
+      const hash = await sha256Hex(value);
+      input.value = '';
+      if (hash === LOCK_PASSWORD_HASH) {
+        localStorage.setItem(UNLOCK_STORAGE_KEY, 'true');
+        document.documentElement.classList.remove('locked');
+        errorEl.classList.add('hidden');
+      } else {
+        errorEl.classList.remove('hidden');
+        input.focus();
+      }
+    }
+
+    btn.addEventListener('click', tryUnlock);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') tryUnlock();
+    });
+  }
+
+  function initLockNowButton() {
+    const btn = document.getElementById('lock-now-btn');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      localStorage.removeItem(UNLOCK_STORAGE_KEY);
+      document.documentElement.classList.add('locked');
+    });
+  }
+
+  /* ---------------------------------------------------------------------
      0. STORAGE MODULE
      --------------------------------------------------------------------- */
   const STORAGE_EVENTS_KEY = 'tr_events';
@@ -1325,6 +1378,8 @@
   }
 
   function init() {
+    initLockScreen();
+    initLockNowButton();
     initNavigation();
     initModal();
     initSnippetLightbox();

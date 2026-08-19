@@ -22,6 +22,28 @@
 </head>
 <body>
 
+<script>
+  // Applica subito la classe "locked" se l'app non è stata sbloccata su questo dispositivo,
+  // prima che il resto della pagina venga disegnato (evita che il contenuto lampeggi un istante).
+  if (localStorage.getItem('tr_unlocked') !== 'true') {
+    document.documentElement.classList.add('locked');
+  }
+</script>
+
+<!-- Schermata di blocco: chiede una password prima di mostrare l'app -->
+<div class="lock-screen" id="lock-screen">
+  <div class="lock-box">
+    <div class="lock-icon">🔒</div>
+    <h2>TheoReminder</h2>
+    <p class="small-text">Inserisci la password per accedere</p>
+    <input type="password" id="lock-password-input" placeholder="Password" autocomplete="current-password">
+    <button class="btn-primary btn-block" id="lock-submit-btn" style="margin-top:12px;">Sblocca</button>
+    <p class="small-text lock-error hidden" id="lock-error">Password errata, riprova.</p>
+  </div>
+</div>
+
+<div id="app-root">
+
 <header class="app-header">
   <h1>📖 TheoReminder</h1>
 </header>
@@ -129,6 +151,11 @@
     </div>
 
     <div class="card">
+      <h3>Sicurezza</h3>
+      <button class="btn-secondary btn-block" id="lock-now-btn">🔒 Blocca subito l'app</button>
+    </div>
+
+    <div class="card">
       <h3>Dati</h3>
       <button class="btn-danger btn-block" id="clear-data-btn">🗑️ Cancella tutti i dati</button>
     </div>
@@ -190,6 +217,8 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+</div> <!-- /#app-root -->
 
 <script src="./app.js"></script>
 </body>
