@@ -17,6 +17,7 @@
      --------------------------------------------------------------------- */
   const LOCK_PASSWORD_HASH = '1b398435e9926210065809fa1ff91a10bd4bffc4f71a13497ea7a88d136f2a61';
   const UNLOCK_STORAGE_KEY = 'tr_unlocked';
+  const SYNC_KEY_STORAGE = 'tr_sync_key'; // la password stessa, usata per autenticare le chiamate al server
 
   async function sha256Hex(text) {
     const bytes = new TextEncoder().encode(text);
@@ -34,13 +35,16 @@
       const value = input.value;
       if (!value) return;
       const hash = await sha256Hex(value);
-      input.value = '';
       if (hash === LOCK_PASSWORD_HASH) {
         localStorage.setItem(UNLOCK_STORAGE_KEY, 'true');
+        localStorage.setItem(SYNC_KEY_STORAGE, value); // serve per autenticare la sincronizzazione col server
         document.documentElement.classList.remove('locked');
         errorEl.classList.add('hidden');
+        input.value = '';
+        syncFromServerOnStartup(); // ora che abbiamo la chiave, prova subito a sincronizzare
       } else {
         errorEl.classList.remove('hidden');
+        input.value = '';
         input.focus();
       }
     }
@@ -56,8 +60,83 @@
     if (!btn) return;
     btn.addEventListener('click', () => {
       localStorage.removeItem(UNLOCK_STORAGE_KEY);
+      localStorage.removeItem(SYNC_KEY_STORAGE);
       document.documentElement.classList.add('locked');
     });
+  }
+
+  /* ---------------------------------------------------------------------
+     SINCRONIZZAZIONE (funzione serverless Vercel + Vercel KV)
+     L'app funziona comunque offline con localStorage come copia locale; quando c'è connessione
+     e la chiave di sync è disponibile (dopo aver sbloccato l'app), si sincronizza col server:
+     - all'avvio: se il server ha dati, li adotta; se il server è vuoto ma il dispositivo ha già
+       dati locali (primo avvio dopo aver attivato la sync), li carica lui sul server;
+     - a ogni salvataggio locale, invia la lista aggiornata al server;
+     - ogni 30s (se la scheda è visibile), ricontrolla se sono arrivati dati da un altro dispositivo.
+     Nessuna gestione avanzata dei conflitti: vince l'ultimo che scrive (uso singolo utente).
+     --------------------------------------------------------------------- */
+  const SYNC_ENDPOINT = '/api/events';
+
+  function getSyncKey() {
+    return localStorage.getItem(SYNC_KEY_STORAGE) || '';
+  }
+
+  async function syncPull() {
+    const key = getSyncKey();
+    if (!key) return null;
+    try {
+      const res = await fetch(SYNC_ENDPOINT, { headers: { 'X-Sync-Key': key } });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return Array.isArray(data.events) ? data.events : null;
+    } catch (e) {
+      return null; // offline, o /api non disponibile (es. in test locali senza Vercel): va bene, resta il locale
+    }
+  }
+
+  async function syncPush(events) {
+    const key = getSyncKey();
+    if (!key) return;
+    try {
+      await fetch(SYNC_ENDPOINT, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
+        body: JSON.stringify({ events })
+      });
+    } catch (e) {
+      // offline: va bene così, il prossimo salvataggio o il polling riproveranno
+    }
+  }
+
+  function refreshAllViewsAfterSync() {
+    recalcAllReminders();
+    renderDashboard();
+    renderStats();
+    if (document.getElementById('view-calendar').classList.contains('active')) renderCalendar();
+  }
+
+  async function syncFromServerOnStartup() {
+    const serverEvents = await syncPull();
+    if (serverEvents === null) return; // niente chiave, offline, o server non raggiungibile
+    const localEvents = Storage.getEvents();
+    if (serverEvents.length > 0) {
+      Storage.saveEvents(serverEvents, { skipSync: true });
+      refreshAllViewsAfterSync();
+    } else if (localEvents.length > 0) {
+      syncPush(localEvents); // primo avvio con la sync attivata: carica sul server quello che c'è già qui
+    }
+  }
+
+  function startSyncPollingLoop() {
+    setInterval(async () => {
+      if (document.hidden) return;
+      const serverEvents = await syncPull();
+      if (serverEvents === null) return;
+      if (JSON.stringify(serverEvents) !== JSON.stringify(Storage.getEvents())) {
+        Storage.saveEvents(serverEvents, { skipSync: true });
+        refreshAllViewsAfterSync();
+      }
+    }, 30000);
   }
 
   /* ---------------------------------------------------------------------
@@ -78,8 +157,13 @@
         return [];
       }
     },
-    saveEvents(events) {
+    saveEvents(events, opts) {
       localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(events));
+      // skipSync: true quando i dati arrivano già dal server (li abbiamo appena ricevuti,
+      // rimandarli indietro sarebbe inutile) — vedi syncFromServerOnStartup / startSyncPollingLoop.
+      if (!(opts && opts.skipSync)) {
+        syncPush(events);
+      }
     },
     addEvent(evt) {
       const events = Storage.getEvents();
@@ -310,7 +394,8 @@
         // (invece di salvare in silenzio), con possibilità di annullare e tornare alla data originale.
         const newDate = info.event.startStr.slice(0, 10);
         openEventModal(info.event.id, newDate, () => info.revert());
-      }
+      },
+      dateClick: (info) => openEventModal(null, info.dateStr) // click su un giorno vuoto → nuovo incarico
     });
     calendarInstance.render();
   }
@@ -323,25 +408,32 @@
   let editingRevertFn = null; // se aperto da un trascinamento: riporta l'evento alla data originale se annulli
 
   function openEventModal(eventId, overrideDate, revertFn) {
-    const evt = Storage.getEvents().find((e) => e.id === eventId);
-    if (!evt) return;
+    // eventId nullo → modalità "nuovo incarico" (aperta dal bottone "+" o da un click su un
+    // giorno vuoto del calendario), altrimenti modalità modifica di un incarico esistente.
+    const isNew = !eventId;
+    const evt = isNew ? null : Storage.getEvents().find((e) => e.id === eventId);
+    if (!isNew && !evt) return;
 
-    editingEventId = eventId;
+    editingEventId = isNew ? null : eventId;
     editingEventOriginal = evt;
     editingRevertFn = revertFn || null;
 
-    document.getElementById('modal-title-input').value = evt.title;
-    document.getElementById('modal-date-input').value = overrideDate || evt.date;
-    document.getElementById('modal-time-input').value = evt.time || '';
-    document.getElementById('modal-desc-input').value = evt.description || '';
+    document.getElementById('modal-title-input').value = evt ? evt.title : '';
+    document.getElementById('modal-date-input').value = overrideDate || (evt ? evt.date : isoDate(new Date()));
+    document.getElementById('modal-time-input').value = evt ? (evt.time || '') : '';
+    document.getElementById('modal-desc-input').value = evt ? (evt.description || '') : '';
 
-    const reminderType = (evt.reminder && evt.reminder.type) || '1day';
+    const reminderType = evt ? ((evt.reminder && evt.reminder.type) || '1day') : '1day';
     document.getElementById('modal-reminder-input').value = reminderType;
     const customDaysInput = document.getElementById('modal-reminder-custom-days');
-    customDaysInput.value = (evt.reminder && evt.reminder.customDays) || '';
+    customDaysInput.value = evt ? ((evt.reminder && evt.reminder.customDays) || '') : '';
     customDaysInput.classList.toggle('hidden', reminderType !== 'custom');
 
+    document.getElementById('modal-heading').textContent = isNew ? 'Nuovo incarico' : 'Modifica incarico';
+    document.getElementById('modal-delete-btn').classList.toggle('hidden', isNew);
+
     document.getElementById('event-modal').classList.remove('hidden');
+    document.getElementById('modal-title-input').focus();
   }
 
   function closeEventModal() {
@@ -373,17 +465,29 @@
       }
     };
 
-    // Se data/ora/promemoria sono cambiati, il promemoria va ricalcolato da capo (anche se
-    // era già scattato per la vecchia data).
-    const orig = editingEventOriginal;
-    const dateOrTimeChanged = !orig || orig.date !== patch.date || orig.time !== patch.time;
-    const reminderChanged = !orig || JSON.stringify(orig.reminder) !== JSON.stringify(patch.reminder);
-    if (dateOrTimeChanged || reminderChanged) patch.reminderFired = false;
+    let saved;
+    if (editingEventId) {
+      // Modifica di un incarico esistente. Se data/ora/promemoria sono cambiati, il promemoria
+      // va ricalcolato da capo (anche se era già scattato per la vecchia data).
+      const orig = editingEventOriginal;
+      const dateOrTimeChanged = !orig || orig.date !== patch.date || orig.time !== patch.time;
+      const reminderChanged = !orig || JSON.stringify(orig.reminder) !== JSON.stringify(patch.reminder);
+      if (dateOrTimeChanged || reminderChanged) patch.reminderFired = false;
+      saved = Storage.updateEvent(editingEventId, patch);
+    } else {
+      // Nuovo incarico aggiunto a mano dal calendario (nessun PDF di origine).
+      saved = Object.assign({
+        id: uuid(),
+        sourcePdf: null,
+        reminderFired: false,
+        createdAt: new Date().toISOString()
+      }, patch);
+      Storage.addEvent(saved);
+    }
 
-    const updated = Storage.updateEvent(editingEventId, patch);
-    if (updated) {
-      clearTimeout(reminderTimers[editingEventId]);
-      scheduleReminderForEvent(updated);
+    if (saved) {
+      clearTimeout(reminderTimers[saved.id]);
+      scheduleReminderForEvent(saved);
     }
 
     editingRevertFn = null; // il nuovo posto è confermato, non serve più tornare indietro
@@ -392,7 +496,7 @@
     editingEventOriginal = null;
     renderCalendar();
     renderDashboard();
-    if (updated && !warnIfSameDayConflict(updated)) showToast('Incarico aggiornato');
+    if (saved && !warnIfSameDayConflict(saved)) showToast('Incarico salvato');
   }
 
   function initModal() {
@@ -408,6 +512,7 @@
     });
 
     document.getElementById('modal-save-btn').addEventListener('click', saveEventModal);
+    document.getElementById('add-event-btn').addEventListener('click', () => openEventModal(null));
 
     document.getElementById('modal-delete-btn').addEventListener('click', () => {
       if (!editingEventId) return;
@@ -1393,6 +1498,11 @@
     renderDashboard();
     recalcAllReminders();
     startReminderPollingLoop();
+
+    // Se il dispositivo era già sbloccato in precedenza, prova subito a sincronizzare;
+    // se l'app è ancora bloccata, ci riproverà appena l'utente inserisce la password (vedi initLockScreen).
+    syncFromServerOnStartup();
+    startSyncPollingLoop();
   }
 
   if (document.readyState === 'loading') {

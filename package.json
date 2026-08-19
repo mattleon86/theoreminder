@@ -1,0 +1,9 @@
+{
+  "name": "theoreminder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agenda personale incarichi congregazione - Matteo Piano (PWA statica + funzione serverless per la sincronizzazione)",
+  "dependencies": {
+    "@vercel/kv": "^2.0.0"
+  }
+}

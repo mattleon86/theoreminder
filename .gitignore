@@ -8,3 +8,10 @@ theoreminder-incarichi.ics
 # File di sistema
 .DS_Store
 Thumbs.db
+
+# Dipendenze e file locali di Vercel
+node_modules/
+.vercel/
+
+.vercel
+.env*

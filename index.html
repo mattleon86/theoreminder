@@ -105,6 +105,8 @@
   <!-- ============ CALENDARIO ============ -->
   <section id="view-calendar" class="view">
     <h2>Calendario</h2>
+    <button class="btn-primary btn-block" id="add-event-btn" style="margin-bottom:12px;">➕ Nuovo incarico</button>
+    <p class="small-text">Puoi anche toccare un giorno vuoto nel calendario per aggiungere un incarico a quella data.</p>
     <div id="calendar"></div>
   </section>
 
@@ -178,7 +180,7 @@
 <div class="modal-overlay hidden" id="event-modal">
   <div class="modal-box">
     <div class="modal-header">
-      <h3>Modifica incarico</h3>
+      <h3 id="modal-heading">Modifica incarico</h3>
       <button class="btn-icon" id="modal-close-btn" aria-label="Chiudi">✖</button>
     </div>
 
