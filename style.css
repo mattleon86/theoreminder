@@ -559,10 +559,29 @@ html.locked .lock-screen {
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 90vw;
+  white-space: nowrap;
 }
 
 .toast.show {
   opacity: 1;
+  pointer-events: auto;
+}
+
+.toast-action {
+  background: transparent;
+  border: none;
+  color: #93c5fd;
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-decoration: underline;
+  padding: 2px;
+  min-height: auto;
+  cursor: pointer;
+  flex-shrink: 0;
 }
 
 .small-text {

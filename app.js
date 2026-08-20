@@ -245,12 +245,31 @@
      2. TOAST
      --------------------------------------------------------------------- */
   let toastTimer = null;
-  function showToast(msg) {
+  // actionLabel/actionFn opzionali: aggiunge un pulsante dentro il toast (es. "Annulla" dopo
+  // un'eliminazione). Resta visibile più a lungo quando c'è un'azione, per dare il tempo di cliccarla.
+  function showToast(msg, actionLabel, actionFn) {
     const toast = document.getElementById('toast');
-    toast.textContent = msg;
+    toast.innerHTML = '';
+
+    const textEl = document.createElement('span');
+    textEl.textContent = msg;
+    toast.appendChild(textEl);
+
+    if (actionLabel && actionFn) {
+      const actionBtn = document.createElement('button');
+      actionBtn.className = 'toast-action';
+      actionBtn.textContent = actionLabel;
+      actionBtn.addEventListener('click', () => {
+        clearTimeout(toastTimer);
+        toast.classList.remove('show');
+        actionFn();
+      });
+      toast.appendChild(actionBtn);
+    }
+
     toast.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toast.classList.remove('show'), 2500);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), actionLabel ? 5000 : 2500);
   }
 
   /* ---------------------------------------------------------------------
@@ -514,16 +533,24 @@
 
     document.getElementById('modal-delete-btn').addEventListener('click', () => {
       if (!editingEventId) return;
-      if (confirm('Eliminare questo incarico?')) {
-        Storage.deleteEvent(editingEventId);
-        editingRevertFn = null; // eliminato volutamente: non riportarlo alla vecchia data
-        document.getElementById('event-modal').classList.add('hidden');
-        editingEventId = null;
-        editingEventOriginal = null;
+      // Elimina subito (nessun popup di conferma): il toast con "Annulla" dà qualche secondo
+      // per ripensarci, senza bloccare il flusso con una domanda ogni volta.
+      const deletedEvent = Storage.getEvents().find((e) => e.id === editingEventId);
+      Storage.deleteEvent(editingEventId);
+      editingRevertFn = null; // eliminato volutamente: non riportarlo alla vecchia data
+      document.getElementById('event-modal').classList.add('hidden');
+      editingEventId = null;
+      editingEventOriginal = null;
+      renderCalendar();
+      renderDashboard();
+      showToast('Incarico eliminato', 'Annulla', () => {
+        if (!deletedEvent) return;
+        Storage.addEvent(deletedEvent);
+        scheduleReminderForEvent(deletedEvent);
         renderCalendar();
         renderDashboard();
-        showToast('Incarico eliminato');
-      }
+        showToast('Incarico ripristinato');
+      });
     });
   }
 
