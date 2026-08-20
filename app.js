@@ -9,15 +9,22 @@
 
   /* ---------------------------------------------------------------------
      LUCCHETTO INIZIALE (password)
-     Protezione semplice: il repository è pubblico (necessario per GitHub Pages gratuito),
-     quindi questa NON è vera sicurezza — chi legge il codice sorgente può trovare l'hash e,
-     con lavoro, risalire alla password. Serve a tenere fuori i visitatori casuali.
-     Una volta sbloccato, il dispositivo se lo ricorda (localStorage) e non richiede più la
-     password finché non si cancellano i dati del sito o non si usa un altro browser/dispositivo.
+     Protezione semplice: il repository è pubblico, quindi questa NON è vera sicurezza — chi legge
+     il codice sorgente può trovare l'hash e, con lavoro, risalire alla password. Serve a tenere
+     fuori i visitatori casuali.
+     Su richiesta esplicita dell'utente, la password viene chiesta a OGNI apertura dell'app (nessun
+     "ricordami"): non la salviamo più in localStorage, resta solo in memoria per la sessione
+     corrente (serve anche come chiave per autenticare la sincronizzazione col server).
      --------------------------------------------------------------------- */
   const LOCK_PASSWORD_HASH = '1b398435e9926210065809fa1ff91a10bd4bffc4f71a13497ea7a88d136f2a61';
-  const UNLOCK_STORAGE_KEY = 'tr_unlocked';
-  const SYNC_KEY_STORAGE = 'tr_sync_key'; // la password stessa, usata per autenticare le chiamate al server
+  let syncKeyInMemory = ''; // la password inserita in questa sessione, tenuta solo in memoria
+
+  // Ripulisce eventuali chiavi lasciate da versioni precedenti dell'app (che ricordavano lo
+  // sblocco tra una sessione e l'altra): non tocca in alcun modo tr_events/tr_settings.
+  function purgeLegacyUnlockStorage() {
+    localStorage.removeItem('tr_unlocked');
+    localStorage.removeItem('tr_sync_key');
+  }
 
   async function sha256Hex(text) {
     const bytes = new TextEncoder().encode(text);
@@ -26,6 +33,8 @@
   }
 
   function initLockScreen() {
+    purgeLegacyUnlockStorage();
+
     const input = document.getElementById('lock-password-input');
     const btn = document.getElementById('lock-submit-btn');
     const errorEl = document.getElementById('lock-error');
@@ -36,8 +45,7 @@
       if (!value) return;
       const hash = await sha256Hex(value);
       if (hash === LOCK_PASSWORD_HASH) {
-        localStorage.setItem(UNLOCK_STORAGE_KEY, 'true');
-        localStorage.setItem(SYNC_KEY_STORAGE, value); // serve per autenticare la sincronizzazione col server
+        syncKeyInMemory = value; // solo in memoria: richiesta di nuovo al prossimo avvio dell'app
         document.documentElement.classList.remove('locked');
         errorEl.classList.add('hidden');
         input.value = '';
@@ -55,16 +63,6 @@
     });
   }
 
-  function initLockNowButton() {
-    const btn = document.getElementById('lock-now-btn');
-    if (!btn) return;
-    btn.addEventListener('click', () => {
-      localStorage.removeItem(UNLOCK_STORAGE_KEY);
-      localStorage.removeItem(SYNC_KEY_STORAGE);
-      document.documentElement.classList.add('locked');
-    });
-  }
-
   /* ---------------------------------------------------------------------
      SINCRONIZZAZIONE (funzione serverless Vercel + Vercel KV)
      L'app funziona comunque offline con localStorage come copia locale; quando c'è connessione
@@ -78,7 +76,7 @@
   const SYNC_ENDPOINT = '/api/events';
 
   function getSyncKey() {
-    return localStorage.getItem(SYNC_KEY_STORAGE) || '';
+    return syncKeyInMemory;
   }
 
   async function syncPull() {
@@ -267,12 +265,12 @@
   }
 
   function getUpcomingEvents(limit) {
-    const now = new Date();
+    // Confronto per giorno (non per data+ora esatta): un incarico di "oggi" deve restare visibile
+    // anche se l'orario indicato è già passato, o se non ha un orario (mezzanotte sarebbe già "nel
+    // passato" rispetto ad ora, facendolo sparire per errore dai "prossimi incarichi").
+    const todayStr = isoDate(new Date());
     return Storage.getEvents()
-      .filter((e) => {
-        const dt = new Date(e.date + 'T' + (e.time || '00:00'));
-        return dt >= now;
-      })
+      .filter((e) => e.date >= todayStr)
       .sort((a, b) => {
         const da = new Date(a.date + 'T' + (a.time || '00:00'));
         const db = new Date(b.date + 'T' + (b.time || '00:00'));
@@ -1484,7 +1482,6 @@
 
   function init() {
     initLockScreen();
-    initLockNowButton();
     initNavigation();
     initModal();
     initSnippetLightbox();

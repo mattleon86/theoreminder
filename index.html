@@ -23,11 +23,9 @@
 <body>
 
 <script>
-  // Applica subito la classe "locked" se l'app non è stata sbloccata su questo dispositivo,
+  // L'app chiede sempre la password all'apertura (nessuna eccezione salvata): blocca subito,
   // prima che il resto della pagina venga disegnato (evita che il contenuto lampeggi un istante).
-  if (localStorage.getItem('tr_unlocked') !== 'true') {
-    document.documentElement.classList.add('locked');
-  }
+  document.documentElement.classList.add('locked');
 </script>
 
 <!-- Schermata di blocco: chiede una password prima di mostrare l'app -->
@@ -150,11 +148,6 @@
     <div class="card">
       <h3>Esportazione</h3>
       <button class="btn-secondary btn-block" id="export-csv-btn">⬇️ Esporta i miei incarichi (CSV)</button>
-    </div>
-
-    <div class="card">
-      <h3>Sicurezza</h3>
-      <button class="btn-secondary btn-block" id="lock-now-btn">🔒 Blocca subito l'app</button>
     </div>
 
     <div class="card">

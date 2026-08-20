@@ -1,5 +1,5 @@
 // Service Worker minimale: cache statica per uso offline + supporto notifiche.
-const CACHE_NAME = 'theoreminder-v3';
+const CACHE_NAME = 'theoreminder-v4';
 const ASSETS = [
   './',
   './index.html',
