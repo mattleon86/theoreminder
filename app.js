@@ -1281,6 +1281,9 @@
   function fireReminder(evt) {
     const current = Storage.getEvents().find((e) => e.id === evt.id);
     if (!current || current.reminderFired) return;
+    // Notifiche disattivate dall'utente: non consumare il promemoria (non segnarlo come "fatto"),
+    // così se le riattiva più tardi il controllo periodico lo recupera comunque (entro 12h).
+    if (!Storage.getSettings().notificationsEnabled) return;
 
     const title = 'Promemoria incarico';
     const body = `${current.title} — ${formatDateIt(current.date, current.time)}`;
@@ -1335,33 +1338,55 @@
     const btn = document.getElementById('enable-notifications-btn');
     const statusEl = document.getElementById('notification-status');
 
+    function isActive() {
+      return Notification.permission === 'granted' && Storage.getSettings().notificationsEnabled;
+    }
+
     function updateStatus() {
-      const settings = Storage.getSettings();
       if (!('Notification' in window)) {
         statusEl.textContent = 'Le notifiche non sono supportate su questo browser.';
         btn.disabled = true;
         return;
       }
-      if (Notification.permission === 'granted' && settings.notificationsEnabled) {
-        statusEl.textContent = '✅ Notifiche attive.';
-        btn.textContent = '🔔 Notifiche attive';
-      } else if (Notification.permission === 'denied') {
+      if (Notification.permission === 'denied') {
         statusEl.textContent = '❌ Notifiche bloccate dal browser. Abilitale nelle impostazioni del sito.';
+        btn.textContent = '🔔 Attiva notifiche';
+        return;
+      }
+      if (isActive()) {
+        statusEl.textContent = '✅ Notifiche attive.';
+        btn.textContent = '🔕 Disattiva notifiche';
       } else {
-        statusEl.textContent = 'Notifiche non ancora attivate.';
+        statusEl.textContent = 'Notifiche non attive.';
         btn.textContent = '🔔 Attiva notifiche';
       }
     }
 
     btn.addEventListener('click', async () => {
       if (!('Notification' in window)) return;
-      const permission = await Notification.requestPermission();
-      if (permission === 'granted') {
+
+      if (isActive()) {
+        // Il permesso del browser resta "concesso" (nessuna API JS può revocarlo): disattiviamo
+        // solo a livello di app, che è quello che conta per smettere di ricevere promemoria.
+        Storage.updateSettings({ notificationsEnabled: false });
+        showToast('Notifiche disattivate');
+        updateStatus();
+        return;
+      }
+
+      if (Notification.permission === 'granted') {
         Storage.updateSettings({ notificationsEnabled: true });
         recalcAllReminders();
         showToast('Notifiche attivate');
       } else {
-        showToast('Permesso notifiche non concesso');
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted') {
+          Storage.updateSettings({ notificationsEnabled: true });
+          recalcAllReminders();
+          showToast('Notifiche attivate');
+        } else {
+          showToast('Permesso notifiche non concesso');
+        }
       }
       updateStatus();
     });
