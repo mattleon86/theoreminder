@@ -2,11 +2,19 @@
 // incarichi salvati e invia una notifica Web Push "vera" per quelli il cui promemoria è dovuto,
 // anche se l'app non è aperta su nessun dispositivo. Questo sostituisce/affianca il motore a
 // setTimeout lato client (app.js), che funziona solo con la scheda/app aperta.
+//
+// Approfitta anche di questa stessa esecuzione per fare, una volta al mese, un backup separato
+// degli incarichi (vedi backupIfDue): il piano gratuito di Vercel permette solo 2 Cron Job per
+// progetto e li usiamo già entrambi per i promemoria, quindi il backup mensile viaggia "a bordo"
+// di questa funzione invece di averne una terza dedicata.
 const { kv } = require('@vercel/kv');
 const webpush = require('web-push');
 
 const EVENTS_KEY = 'theoreminder:events';
 const SUBS_KEY = 'theoreminder:push-subscriptions';
+const BACKUP_PREFIX = 'theoreminder:events-backup:';
+const BACKUP_INDEX_KEY = 'theoreminder:events-backup-index';
+const KEEP_BACKUPS = 12; // ~1 anno di storico mensile
 const REMINDER_DAYS = { '3days': 3, '1day': 1 };
 // Il piano gratuito di Vercel esegue i Cron Job al massimo una volta al giorno per job (qui ne
 // usiamo due, mattina e sera: vedi vercel.json). Finestra più larga di quella usata dal motore
@@ -35,6 +43,27 @@ function formatDateIt(dateStr, time) {
   return `${d}/${m}/${y}${time ? ' alle ' + time : ''}`;
 }
 
+// Salva uno snapshot degli incarichi una volta al mese (idempotente: se rieseguito più volte lo
+// stesso giorno sovrascrive semplicemente lo snapshot del mese corrente) e tiene solo gli ultimi
+// KEEP_BACKUPS mesi. Serve come rete di sicurezza se theoreminder:events si rompe o si svuota per
+// errore: consultabile/recuperabile da api/list-backups.js.
+async function backupIfDue(events) {
+  const now = new Date();
+  if (now.getUTCDate() !== 1) return; // solo il primo giorno del mese (UTC)
+
+  const label = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+  await kv.set(`${BACKUP_PREFIX}${label}`, { savedAt: now.toISOString(), events });
+
+  const index = (await kv.get(BACKUP_INDEX_KEY)) || [];
+  if (!index.includes(label)) index.push(label);
+  index.sort();
+  while (index.length > KEEP_BACKUPS) {
+    const oldest = index.shift();
+    await kv.del(`${BACKUP_PREFIX}${oldest}`);
+  }
+  await kv.set(BACKUP_INDEX_KEY, index);
+}
+
 module.exports = async function handler(req, res) {
   if (!isAuthorized(req)) {
     res.status(401).json({ error: 'Non autorizzato' });
@@ -50,6 +79,8 @@ module.exports = async function handler(req, res) {
   webpush.setVapidDetails('mailto:matteoester.piano@gmail.com', vapidPublic, vapidPrivate);
 
   const events = (await kv.get(EVENTS_KEY)) || [];
+  await backupIfDue(events);
+
   let subs = (await kv.get(SUBS_KEY)) || [];
   if (subs.length === 0) {
     res.status(200).json({ ok: true, sent: 0, note: 'Nessun dispositivo sottoscritto' });
