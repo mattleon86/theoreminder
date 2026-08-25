@@ -4,6 +4,7 @@
   "private": true,
   "description": "Agenda personale incarichi congregazione - Matteo Piano (PWA statica + funzione serverless per la sincronizzazione)",
   "dependencies": {
-    "@vercel/kv": "^2.0.0"
+    "@vercel/kv": "^2.0.0",
+    "web-push": "^3.6.7"
   }
 }

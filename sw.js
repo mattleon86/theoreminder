@@ -1,5 +1,5 @@
-// Service Worker minimale: cache statica per uso offline + supporto notifiche.
-const CACHE_NAME = 'theoreminder-v4';
+// Service Worker minimale: cache statica per uso offline + supporto notifiche (locali e Web Push).
+const CACHE_NAME = 'theoreminder-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -55,5 +55,41 @@ self.addEventListener('notificationclick', (event) => {
         self.clients.openWindow('./index.html');
       }
     })
+  );
+});
+
+// Notifica Web Push "vera" ricevuta dal server (api/send-reminders.js), anche ad app chiusa:
+// mostra la notifica con titolo/testo presi dal payload JSON inviato dal server.
+self.addEventListener('push', (event) => {
+  let data = { title: 'Promemoria incarico', body: '' };
+  try {
+    if (event.data) data = Object.assign(data, event.data.json());
+  } catch (e) {
+    // payload non-JSON o mancante: usa i valori di default sopra
+  }
+  event.waitUntil(
+    self.registration.showNotification(data.title, {
+      body: data.body,
+      icon: './icons/icon-192.png',
+      badge: './icons/icon-192.png'
+    })
+  );
+});
+
+// Il browser può invalidare/rinnovare la sottoscrizione push da solo (es. scaduta): qui la
+// ricreiamo con la stessa chiave pubblica e la giriamo alla pagina, che la reinvia al server.
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(
+    (async () => {
+      try {
+        const options = (event.oldSubscription && event.oldSubscription.options)
+          || { userVisibleOnly: true, applicationServerKey: event.applicationServerKey };
+        const newSub = await self.registration.pushManager.subscribe(options);
+        const clientsList = await self.clients.matchAll({ type: 'window' });
+        clientsList.forEach((c) => c.postMessage({ type: 'push-resubscribed', subscription: newSub.toJSON() }));
+      } catch (e) {
+        // se fallisce non c'è molto da fare qui: l'utente dovrà riattivare le notifiche dall'app
+      }
+    })()
   );
 });

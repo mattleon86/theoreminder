@@ -50,6 +50,7 @@
         errorEl.classList.add('hidden');
         input.value = '';
         syncFromServerOnStartup(); // ora che abbiamo la chiave, prova subito a sincronizzare
+        ensurePushSubscription(); // idem per la sottoscrizione push (serve la chiave per autenticarsi alle API)
       } else {
         errorEl.classList.remove('hidden');
         input.value = '';
@@ -1309,6 +1310,84 @@
     }
   }
 
+  /* ---------------------------------------------------------------------
+     7bis. WEB PUSH "VERO" (funziona anche ad app chiusa)
+     Il motore sopra (setTimeout + polling ogni 25s) mostra le notifiche solo mentre l'app è
+     aperta in una scheda. Per ricevere i promemoria anche ad app chiusa, il dispositivo si
+     sottoscrive alle notifiche push del browser e la sottoscrizione viene inviata al server
+     (api/push-subscribe.js); un Cron Job su Vercel (api/send-reminders.js, vedi vercel.json)
+     controlla periodicamente gli incarichi e invia lui le notifiche push quando serve.
+     --------------------------------------------------------------------- */
+  const VAPID_KEY_ENDPOINT = '/api/vapid-public-key';
+  const PUSH_SUBSCRIBE_ENDPOINT = '/api/push-subscribe';
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; i++) outputArray[i] = rawData.charCodeAt(i);
+    return outputArray;
+  }
+
+  async function subscribeToPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return false;
+    const key = getSyncKey();
+    if (!key) return false; // serve la password per autenticarsi alle API server
+    try {
+      const keyRes = await fetch(VAPID_KEY_ENDPOINT, { headers: { 'X-Sync-Key': key } });
+      if (!keyRes.ok) return false;
+      const { publicKey } = await keyRes.json();
+      if (!publicKey) return false;
+
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(publicKey)
+        });
+      }
+      await fetch(PUSH_SUBSCRIBE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
+        body: JSON.stringify({ subscription: sub.toJSON() })
+      });
+      return true;
+    } catch (e) {
+      return false; // offline, permesso negato dal sistema, o /api non disponibile (es. test locali senza Vercel)
+    }
+  }
+
+  async function unsubscribeFromPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) return;
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe();
+      const key = getSyncKey();
+      if (key) {
+        await fetch(PUSH_SUBSCRIBE_ENDPOINT, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
+          body: JSON.stringify({ endpoint })
+        });
+      }
+    } catch (e) {
+      // va bene comunque: se la sottoscrizione resta orfana, il server la ripulisce al primo invio fallito
+    }
+  }
+
+  // Ri-registra la sottoscrizione push all'avvio se le notifiche sono già attive (es. dopo che il
+  // browser l'ha invalidata, o su un dispositivo dove non è mai stata inviata al server).
+  function ensurePushSubscription() {
+    if (('Notification' in window) && Notification.permission === 'granted' && Storage.getSettings().notificationsEnabled) {
+      subscribeToPush();
+    }
+  }
+
   function recalcAllReminders() {
     const events = Storage.getEvents();
     events.forEach((evt) => scheduleReminderForEvent(evt));
@@ -1369,6 +1448,7 @@
         // Il permesso del browser resta "concesso" (nessuna API JS può revocarlo): disattiviamo
         // solo a livello di app, che è quello che conta per smettere di ricevere promemoria.
         Storage.updateSettings({ notificationsEnabled: false });
+        unsubscribeFromPush();
         showToast('Notifiche disattivate');
         updateStatus();
         return;
@@ -1377,12 +1457,14 @@
       if (Notification.permission === 'granted') {
         Storage.updateSettings({ notificationsEnabled: true });
         recalcAllReminders();
+        await subscribeToPush();
         showToast('Notifiche attivate');
       } else {
         const permission = await Notification.requestPermission();
         if (permission === 'granted') {
           Storage.updateSettings({ notificationsEnabled: true });
           recalcAllReminders();
+          await subscribeToPush();
           showToast('Notifiche attivate');
         } else {
           showToast('Permesso notifiche non concesso');
@@ -1528,6 +1610,19 @@
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch((err) => {
         console.error('Registrazione service worker fallita', err);
+      });
+      // Il service worker ci avvisa se ha dovuto rinnovare da solo la sottoscrizione push
+      // (evento pushsubscriptionchange, vedi sw.js): la giriamo subito al server.
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data && event.data.type === 'push-resubscribed') {
+          const key = getSyncKey();
+          if (!key) return;
+          fetch(PUSH_SUBSCRIBE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
+            body: JSON.stringify({ subscription: event.data.subscription })
+          }).catch(() => {});
+        }
       });
     }
   }
