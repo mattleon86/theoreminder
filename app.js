@@ -401,6 +401,7 @@
     calendarInstance = new FullCalendar.Calendar(calendarEl, {
       initialView: 'dayGridMonth',
       locale: 'it',
+      firstDay: 1, // settimana da lunedì a domenica
       height: 'auto',
       headerToolbar: { left: 'prev,next today', center: 'title', right: 'dayGridMonth,listMonth' },
       events: events,
