@@ -34,6 +34,9 @@
     <div class="lock-icon">🔒</div>
     <h2>TheoReminder</h2>
     <p class="small-text">Inserisci la password per accedere</p>
+
+    <button class="btn-secondary btn-block hidden" id="lock-fingerprint-btn" style="margin-bottom:12px;">👆 Sblocca con impronta</button>
+
     <input type="password" id="lock-password-input" placeholder="Password" autocomplete="current-password">
     <button class="btn-primary btn-block" id="lock-submit-btn" style="margin-top:12px;">Sblocca</button>
     <p class="small-text lock-error hidden" id="lock-error">Password errata, riprova.</p>
@@ -143,6 +146,13 @@
       <p>Ricevi un promemoria prima di ogni incarico.</p>
       <button class="btn-primary" id="enable-notifications-btn">🔔 Attiva notifiche</button>
       <p class="small-text" id="notification-status" style="margin-top:8px;"></p>
+    </div>
+
+    <div class="card">
+      <h3>Sicurezza</h3>
+      <p>Sblocca l'app con l'impronta digitale su questo dispositivo, invece di digitare la password ogni volta.</p>
+      <button class="btn-secondary btn-block" id="fingerprint-toggle-btn">👆 Attiva impronta digitale</button>
+      <p class="small-text" id="fingerprint-status" style="margin-top:8px;"></p>
     </div>
 
     <div class="card">

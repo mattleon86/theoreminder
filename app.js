@@ -38,19 +38,26 @@
     const input = document.getElementById('lock-password-input');
     const btn = document.getElementById('lock-submit-btn');
     const errorEl = document.getElementById('lock-error');
+    const fingerprintBtn = document.getElementById('lock-fingerprint-btn');
     if (!input || !btn) return;
+
+    // Sblocco riuscito (via password o via impronta): entra nell'app e avvia le chiamate che
+    // hanno bisogno della password come chiave di autenticazione (sync ed eventuale push).
+    function completeUnlock(password) {
+      syncKeyInMemory = password; // solo in memoria: richiesta di nuovo al prossimo avvio dell'app
+      document.documentElement.classList.remove('locked');
+      errorEl.classList.add('hidden');
+      input.value = '';
+      syncFromServerOnStartup();
+      ensurePushSubscription();
+    }
 
     async function tryUnlock() {
       const value = input.value;
       if (!value) return;
       const hash = await sha256Hex(value);
       if (hash === LOCK_PASSWORD_HASH) {
-        syncKeyInMemory = value; // solo in memoria: richiesta di nuovo al prossimo avvio dell'app
-        document.documentElement.classList.remove('locked');
-        errorEl.classList.add('hidden');
-        input.value = '';
-        syncFromServerOnStartup(); // ora che abbiamo la chiave, prova subito a sincronizzare
-        ensurePushSubscription(); // idem per la sottoscrizione push (serve la chiave per autenticarsi alle API)
+        completeUnlock(value);
       } else {
         errorEl.classList.remove('hidden');
         input.value = '';
@@ -58,10 +65,181 @@
       }
     }
 
+    async function tryFingerprintUnlock() {
+      const password = await unlockWithFingerprint();
+      if (password) {
+        completeUnlock(password);
+      } else {
+        showToast('Sblocco con impronta non riuscito, usa la password');
+      }
+    }
+
     btn.addEventListener('click', tryUnlock);
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') tryUnlock();
     });
+
+    if (fingerprintBtn) {
+      fingerprintBtn.addEventListener('click', tryFingerprintUnlock);
+      // Il bottone appare solo se l'impronta è stata attivata su questo dispositivo (vedi
+      // Impostazioni → Sicurezza) e il telefono ha davvero un sensore biometrico disponibile.
+      (async () => {
+        if (hasFingerprintUnlockSetup() && (await platformAuthenticatorAvailable())) {
+          fingerprintBtn.classList.remove('hidden');
+        }
+      })();
+    }
+  }
+
+  /* ---------------------------------------------------------------------
+     SBLOCCO CON IMPRONTA DIGITALE (WebAuthn, opzionale, per dispositivo)
+     Usa il sensore biometrico del telefono (o l'equivalente del computer) tramite l'API
+     WebAuthn del browser. Per funzionare come vera scorciatoia — sia per entrare nell'app sia
+     per autenticare la sincronizzazione col server, che usa la password stessa come chiave —
+     la password reale deve poter essere recuperata dopo la verifica biometrica: viene quindi
+     salvata su QUESTO dispositivo (non sul server), leggibile solo dopo che il sensore ha
+     riconosciuto l'impronta registrata. È una scelta esplicita dell'utente, attivabile e
+     disattivabile in Impostazioni → Sicurezza, dispositivo per dispositivo: prima di attivarla
+     l'app non salva la password da nessuna parte (vedi sopra).
+     --------------------------------------------------------------------- */
+  const WEBAUTHN_CRED_ID_KEY = 'tr_webauthn_credential_id';
+  const WEBAUTHN_PASSWORD_KEY = 'tr_webauthn_password';
+
+  function webAuthnAvailable() {
+    return !!(window.PublicKeyCredential && navigator.credentials);
+  }
+
+  async function platformAuthenticatorAvailable() {
+    if (!webAuthnAvailable() || !PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) return false;
+    try {
+      return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function hasFingerprintUnlockSetup() {
+    return !!(localStorage.getItem(WEBAUTHN_CRED_ID_KEY) && localStorage.getItem(WEBAUTHN_PASSWORD_KEY));
+  }
+
+  function bufferToBase64url(buf) {
+    const bytes = new Uint8Array(buf);
+    let str = '';
+    for (let i = 0; i < bytes.length; i++) str += String.fromCharCode(bytes[i]);
+    return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function base64urlToBuffer(b64url) {
+    const base64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    const str = atob(padded);
+    const bytes = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  // Registra una nuova credenziale biometrica su questo dispositivo e ci lega la password
+  // corrente (quella con cui l'utente ha appena sbloccato l'app in questa sessione).
+  async function setupFingerprintUnlock() {
+    if (!syncKeyInMemory) {
+      showToast('Sblocca prima con la password per attivare l\'impronta');
+      return false;
+    }
+    try {
+      const credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          rp: { name: 'TheoReminder' },
+          user: {
+            id: crypto.getRandomValues(new Uint8Array(16)),
+            name: 'matteo.piano',
+            displayName: 'Matteo Piano'
+          },
+          pubKeyCredParams: [{ alg: -7, type: 'public-key' }, { alg: -257, type: 'public-key' }],
+          authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required' },
+          timeout: 60000,
+          attestation: 'none'
+        }
+      });
+      if (!credential) throw new Error('Nessuna credenziale creata');
+      localStorage.setItem(WEBAUTHN_CRED_ID_KEY, bufferToBase64url(credential.rawId));
+      // btoa non è crittografia: serve solo a non lasciare la password leggibile a colpo
+      // d'occhio in chiaro tra le chiavi di localStorage. Il vero gate è la verifica biometrica.
+      localStorage.setItem(WEBAUTHN_PASSWORD_KEY, btoa(syncKeyInMemory));
+      return true;
+    } catch (e) {
+      return false; // utente ha annullato, o il dispositivo non supporta/ha rifiutato
+    }
+  }
+
+  function disableFingerprintUnlock() {
+    localStorage.removeItem(WEBAUTHN_CRED_ID_KEY);
+    localStorage.removeItem(WEBAUTHN_PASSWORD_KEY);
+  }
+
+  // Chiede la verifica biometrica e, se riuscita, restituisce la password salvata su questo
+  // dispositivo (altrimenti null). Non fa nessuna verifica crittografica della firma: si fida
+  // del fatto che il browser abbia già richiesto la verifica dell'utente (userVerification:
+  // 'required') prima di far risolvere la Promise — coerente con il livello di sicurezza
+  // "casuale" dichiarato per l'intera app (vedi commento sul lucchetto, sopra).
+  async function unlockWithFingerprint() {
+    const credIdB64 = localStorage.getItem(WEBAUTHN_CRED_ID_KEY);
+    const storedPw = localStorage.getItem(WEBAUTHN_PASSWORD_KEY);
+    if (!credIdB64 || !storedPw) return null;
+    try {
+      const assertion = await navigator.credentials.get({
+        publicKey: {
+          challenge: crypto.getRandomValues(new Uint8Array(32)),
+          allowCredentials: [{ id: base64urlToBuffer(credIdB64), type: 'public-key' }],
+          userVerification: 'required',
+          timeout: 60000
+        }
+      });
+      if (!assertion) return null;
+      return atob(storedPw);
+    } catch (e) {
+      return null; // impronta non riconosciuta, annullato, o credenziale non più valida
+    }
+  }
+
+  function initSecuritySettings() {
+    const btn = document.getElementById('fingerprint-toggle-btn');
+    const statusEl = document.getElementById('fingerprint-status');
+    if (!btn || !statusEl) return;
+
+    async function updateStatus() {
+      if (!webAuthnAvailable()) {
+        statusEl.textContent = 'Non supportata su questo browser.';
+        btn.disabled = true;
+        return;
+      }
+      if (!(await platformAuthenticatorAvailable())) {
+        statusEl.textContent = 'Nessun sensore di impronte/biometria rilevato su questo dispositivo.';
+        btn.disabled = true;
+        return;
+      }
+      btn.disabled = false;
+      if (hasFingerprintUnlockSetup()) {
+        statusEl.textContent = '✅ Attiva su questo dispositivo.';
+        btn.textContent = '🚫 Disattiva impronta digitale';
+      } else {
+        statusEl.textContent = 'Non attiva su questo dispositivo.';
+        btn.textContent = '👆 Attiva impronta digitale';
+      }
+    }
+
+    btn.addEventListener('click', async () => {
+      if (hasFingerprintUnlockSetup()) {
+        disableFingerprintUnlock();
+        showToast('Impronta digitale disattivata su questo dispositivo');
+      } else {
+        const ok = await setupFingerprintUnlock();
+        showToast(ok ? 'Impronta digitale attivata su questo dispositivo' : 'Impronta non attivata');
+      }
+      updateStatus();
+    });
+
+    updateStatus();
   }
 
   /* ---------------------------------------------------------------------
@@ -1635,6 +1813,7 @@
     initSnippetLightbox();
     initPdfUpload();
     initNotifications();
+    initSecuritySettings();
     initClearData();
     registerServiceWorker();
 
