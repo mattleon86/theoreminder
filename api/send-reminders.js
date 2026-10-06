@@ -90,6 +90,10 @@ module.exports = async function handler(req, res) {
   const now = Date.now();
   const due = events.filter((evt) => {
     if (evt.reminderFired) return false;
+    // Anti-doppia notifica: se il motore lato client (app aperta) l'ha già inviato, ma per un
+    // problema di rete il flag è arrivato in ritardo o si è perso, il timestamp blocca il reinvio.
+    const firedAt = Date.parse(evt.reminderFiredAt || '');
+    if (isFinite(firedAt) && now - firedAt < MISSED_WINDOW_MS) return false;
     const offset = getReminderOffsetMs(evt.reminder);
     if (offset === null) return false;
     const eventTime = new Date(evt.date + 'T' + (evt.time || '00:00')).getTime();
@@ -108,6 +112,10 @@ module.exports = async function handler(req, res) {
       title: 'Promemoria incarico',
       body: `${evt.title} — ${formatDateIt(evt.date, evt.time)}`
     });
+    // Marchia PRIMA l'invio nel KV (prima di aspettare la consegna): se l'app rilegge lo stato
+    // durante l'invio, non deve poter rispedire la stessa notifica dal motore client.
+    evt.reminderFired = true;
+    evt.reminderFiredAt = new Date().toISOString();
     await Promise.all(subs.map(async (sub) => {
       try {
         await webpush.sendNotification(sub, payload);
@@ -118,7 +126,6 @@ module.exports = async function handler(req, res) {
         }
       }
     }));
-    evt.reminderFired = true;
   }
 
   if (deadEndpoints.size > 0) {

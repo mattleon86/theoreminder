@@ -250,14 +250,29 @@
        dati locali (primo avvio dopo aver attivato la sync), li carica lui sul server;
      - a ogni salvataggio locale, invia la lista aggiornata al server;
      - ogni 30s (se la scheda è visibile), ricontrolla se sono arrivati dati da un altro dispositivo.
-     Nessuna gestione avanzata dei conflitti: vince l'ultimo che scrive (uso singolo utente).
+     Conflitti: merge PER EVENTO, vince chi ha `updatedAt` più recente (niente sovrascritture alla
+     cieca: due dispositivi che modificano vicino non si cancellano a vicenda) e le eliminazioni
+     viaggiano come tombstone (`tr_deleted`), quindi non "risorgono".
+     Pull e push vanno in coda uno dopo l'altro (syncChain): una risposta "vecchia" del server
+     non può eseguirsi dopo una modifica locale appena fatta.
      --------------------------------------------------------------------- */
   const SYNC_ENDPOINT = '/api/events';
+  const TOMBSTONE_TTL_MS = 60 * 24 * 60 * 60 * 1000; // i tombstone delle eliminazioni scadono dopo 60 giorni
+
+  let syncChain = Promise.resolve(); // coda seriale delle operazioni di sync
 
   function getSyncKey() {
     return syncKeyInMemory;
   }
 
+  // Mette in coda un'operazione di sync: parte solo quando tutte le precedenti sono finite,
+  // così una risposta del server non può mai sovrascrivere una modifica locale più recente.
+  function enqueueSync(task) {
+    syncChain = syncChain.then(task, task);
+    return syncChain;
+  }
+
+  // Legge lo stato del server: { events, deleted } oppure null (offline / niente chiave).
   async function syncPull() {
     const key = getSyncKey();
     if (!key) return null;
@@ -265,24 +280,100 @@
       const res = await fetch(SYNC_ENDPOINT, { headers: { 'X-Sync-Key': key } });
       if (!res.ok) return null;
       const data = await res.json();
-      return Array.isArray(data.events) ? data.events : null;
+      if (!Array.isArray(data.events)) return null;
+      return {
+        events: data.events,
+        deleted: (data.deleted && typeof data.deleted === 'object') ? data.deleted : {}
+      };
     } catch (e) {
       return null; // offline, o /api non disponibile (es. in test locali senza Vercel): va bene, resta il locale
     }
   }
 
-  async function syncPush(events) {
+  async function syncPush(state) {
     const key = getSyncKey();
     if (!key) return;
     try {
       await fetch(SYNC_ENDPOINT, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
-        body: JSON.stringify({ events })
+        body: JSON.stringify(state)
       });
     } catch (e) {
       // offline: va bene così, il prossimo salvataggio o il polling riproveranno
     }
+  }
+
+  // "Età" di un incarico: quando è stato modificato l'ultima volta (0 se manca = molto vecchio).
+  function eventStamp(evt) {
+    const t = Date.parse((evt && evt.updatedAt) || '');
+    return isFinite(t) ? t : 0;
+  }
+
+  // Merge tra stato locale e stato del server → { events, deleted }.
+  function mergeSyncState(localEvents, localDeleted, serverEvents, serverDeleted) {
+    const now = Date.now();
+
+    // 1) tombstone: unione, per ogni id tiene quello più recente, scarta quelli scaduti (60 gg)
+    const deleted = {};
+    [localDeleted, serverDeleted].forEach((map) => {
+      Object.keys(map || {}).forEach((id) => {
+        const ts = Date.parse(map[id]);
+        if (!isFinite(ts) || now - ts > TOMBSTONE_TTL_MS) return;
+        if (!deleted[id] || ts > Date.parse(deleted[id])) deleted[id] = map[id];
+      });
+    });
+
+    // 2) per ogni id vince la versione con updatedAt più recente
+    const winner = {};
+    const put = (evt) => {
+      if (!evt || !evt.id) return;
+      if (!winner[evt.id] || eventStamp(evt) > eventStamp(winner[evt.id])) winner[evt.id] = evt;
+    };
+    localEvents.forEach(put);
+    (serverEvents || []).forEach(put);
+
+    // 3) le eliminazioni vincono solo se più recenti dell'ultimo aggiornamento dell'evento
+    const isDeleted = (id) => {
+      const tomb = Date.parse(deleted[id]);
+      return isFinite(tomb) && tomb >= eventStamp(winner[id]);
+    };
+
+    // 4) risultato nell'ordine locale, poi gli eventi arrivati dal server (niente duplicati)
+    const merged = [];
+    const seen = {};
+    const addIfAlive = (evt) => {
+      if (!evt || !evt.id || seen[evt.id] || isDeleted(evt.id)) return;
+      seen[evt.id] = 1;
+      merged.push(winner[evt.id]);
+    };
+    localEvents.forEach(addIfAlive);
+    (serverEvents || []).forEach(addIfAlive);
+
+    return { events: merged, deleted };
+  }
+
+  // Confronti "stabili" sul CONTENUTO (indipendenti dall'ordine): senza, due dispositivi con gli
+  // stessi eventi in ordine diverso si rispedirebbero i dati a ogni polling, all'infinito.
+  function sameEventList(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    const byId = (list) => {
+      const m = {};
+      list.forEach((e) => { if (e && e.id) m[e.id] = e; });
+      return m;
+    };
+    const ma = byId(a);
+    const mb = byId(b);
+    const idsA = Object.keys(ma);
+    if (idsA.length !== Object.keys(mb).length) return false;
+    return idsA.every((id) => JSON.stringify(ma[id]) === JSON.stringify(mb[id]));
+  }
+
+  function sameDeletedMap(a, b) {
+    const ka = Object.keys(a || {}).sort();
+    const kb = Object.keys(b || {}).sort();
+    if (ka.length !== kb.length) return false;
+    return ka.every((k, i) => k === kb[i] && a[k] === b[k]);
   }
 
   function refreshAllViewsAfterSync() {
@@ -292,27 +383,39 @@
     if (document.getElementById('view-calendar').classList.contains('active')) renderCalendar();
   }
 
-  async function syncFromServerOnStartup() {
-    const serverEvents = await syncPull();
-    if (serverEvents === null) return; // niente chiave, offline, o server non raggiungibile
-    const localEvents = Storage.getEvents();
-    if (serverEvents.length > 0) {
-      Storage.saveEvents(serverEvents, { skipSync: true });
-      refreshAllViewsAfterSync();
-    } else if (localEvents.length > 0) {
-      syncPush(localEvents); // primo avvio con la sync attivata: carica sul server quello che c'è già qui
+  // Applica lo stato unito al localStorage (senza rispedirlo) e aggiorna le viste se è cambiato.
+  function applyMergedState(merged, previous) {
+    const eventsChanged = !sameEventList(merged.events, previous.events);
+    const deletedChanged = !sameDeletedMap(merged.deleted, previous.deleted);
+    if (!eventsChanged && !deletedChanged) return false;
+    localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(merged.events));
+    localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(merged.deleted));
+    if (eventsChanged) refreshAllViewsAfterSync();
+    return true;
+  }
+
+  // Un'unità di lavoro della sync: pull → merge → eventuale push del risultato.
+  async function syncOnce() {
+    const server = await syncPull();
+    if (!server) return; // offline o chiave mancante: resta il locale
+    const local = { events: Storage.getEvents(), deleted: Storage.getDeleted() };
+    const merged = mergeSyncState(local.events, local.deleted, server.events, server.deleted);
+    applyMergedState(merged, local);
+    // Rispediamo solo se il server NON corrisponde più al risultato unito
+    // (tipico: primo avvio, o modifiche fatte offline su questo dispositivo).
+    if (!sameEventList(merged.events, server.events) || !sameDeletedMap(merged.deleted, server.deleted)) {
+      await syncPush(merged);
     }
   }
 
+  function syncFromServerOnStartup() {
+    enqueueSync(syncOnce);
+  }
+
   function startSyncPollingLoop() {
-    setInterval(async () => {
+    setInterval(() => {
       if (document.hidden) return;
-      const serverEvents = await syncPull();
-      if (serverEvents === null) return;
-      if (JSON.stringify(serverEvents) !== JSON.stringify(Storage.getEvents())) {
-        Storage.saveEvents(serverEvents, { skipSync: true });
-        refreshAllViewsAfterSync();
-      }
+      enqueueSync(syncOnce);
     }, 30000);
   }
 
@@ -321,6 +424,7 @@
      --------------------------------------------------------------------- */
   const STORAGE_EVENTS_KEY = 'tr_events';
   const STORAGE_SETTINGS_KEY = 'tr_settings';
+  const STORAGE_DELETED_KEY = 'tr_deleted'; // tombstone { id: ISO } delle eliminazioni (per la sync)
 
   const DEFAULT_SETTINGS = { notificationsEnabled: false };
 
@@ -334,16 +438,29 @@
         return [];
       }
     },
+    getDeleted() {
+      try {
+        const raw = localStorage.getItem(STORAGE_DELETED_KEY);
+        const map = raw ? JSON.parse(raw) : {};
+        return (map && typeof map === 'object' && !Array.isArray(map)) ? map : {};
+      } catch (e) {
+        console.error('Errore lettura tr_deleted', e);
+        return {};
+      }
+    },
     saveEvents(events, opts) {
       localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(events));
       // skipSync: true quando i dati arrivano già dal server (li abbiamo appena ricevuti,
       // rimandarli indietro sarebbe inutile) — vedi syncFromServerOnStartup / startSyncPollingLoop.
+      // Il push non è il "solo stato locale": fa pull+merge+push (syncOnce), così un evento
+      // creato intanto sull'altro dispositivo non viene sovrascritto da questo salvataggio.
       if (!(opts && opts.skipSync)) {
-        syncPush(events);
+        enqueueSync(syncOnce);
       }
     },
     addEvent(evt) {
       const events = Storage.getEvents();
+      evt.updatedAt = new Date().toISOString(); // serve al merge: questo dispositivo l'ha creato adesso
       events.push(evt);
       Storage.saveEvents(events);
       return evt;
@@ -352,13 +469,28 @@
       const events = Storage.getEvents();
       const idx = events.findIndex((e) => e.id === id);
       if (idx === -1) return null;
+      // Anche le modifiche "piccole" (es. reminderFired) aggiornano updatedAt: è il modo con cui
+      // il merge sa che questa versione è più recente di quella eventualmente sul server.
+      patch.updatedAt = new Date().toISOString();
       events[idx] = Object.assign({}, events[idx], patch);
       Storage.saveEvents(events);
       return events[idx];
     },
     deleteEvent(id) {
       const events = Storage.getEvents().filter((e) => e.id !== id);
+      // Tombstone: senza, il prossimo merge con il server "risusciterebbe" l'evento eliminato.
+      const deleted = Storage.getDeleted();
+      deleted[id] = new Date().toISOString();
+      localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted));
       Storage.saveEvents(events);
+    },
+    // "Cancella tutti i dati": elimina tutto anche sugli altri dispositivi (tombstone per ogni evento).
+    deleteAll() {
+      const deleted = Storage.getDeleted();
+      const now = new Date().toISOString();
+      Storage.getEvents().forEach((e) => { if (e && e.id) deleted[e.id] = now; });
+      localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted));
+      Storage.saveEvents([]);
     },
     getSettings() {
       try {
@@ -669,7 +801,10 @@
       const orig = editingEventOriginal;
       const dateOrTimeChanged = !orig || orig.date !== patch.date || orig.time !== patch.time;
       const reminderChanged = !orig || JSON.stringify(orig.reminder) !== JSON.stringify(patch.reminder);
-      if (dateOrTimeChanged || reminderChanged) patch.reminderFired = false;
+      if (dateOrTimeChanged || reminderChanged) {
+        patch.reminderFired = false;
+        patch.reminderFiredAt = null; // azzerato anche lui: così la finestra anti-doppia notifica riparte
+      }
       saved = Storage.updateEvent(editingEventId, patch);
     } else {
       // Nuovo incarico aggiunto a mano dal calendario (nessun PDF di origine).
@@ -1458,18 +1593,26 @@
     }
   }
 
+  // Finestra entro la quale un promemoria già inviato blocca un reinvio dall'altro motore
+  // (client o cron server): serve se uno dei due era offline e il flag arriva in ritardo.
+  const FIRED_DEDUP_MS = 24 * 60 * 60 * 1000;
+
   function fireReminder(evt) {
     const current = Storage.getEvents().find((e) => e.id === evt.id);
     if (!current || current.reminderFired) return;
+    const firedAt = Date.parse(current.reminderFiredAt || '');
+    if (isFinite(firedAt) && Date.now() - firedAt < FIRED_DEDUP_MS) return;
     // Notifiche disattivate dall'utente: non consumare il promemoria (non segnarlo come "fatto"),
     // così se le riattiva più tardi il controllo periodico lo recupera comunque (entro 12h).
     if (!Storage.getSettings().notificationsEnabled) return;
 
-    const title = 'Promemoria incarico';
-    const body = `${current.title} — ${formatDateIt(current.date, current.time)}`;
+    // 1) PRIMA si marca il promemoria come inviato: updateEvent accoda anche il push al server,
+    //    così il cron Vercel (quando sta per girare alle 06:00/18:00 UTC) vede il flag e non
+    //    invia la stessa notifica due volte.
+    Storage.updateEvent(current.id, { reminderFired: true, reminderFiredAt: new Date().toISOString() });
 
-    showNotification(title, body);
-    Storage.updateEvent(current.id, { reminderFired: true });
+    // 2) Poi si mostra la notifica locale.
+    showNotification('Promemoria incarico', `${current.title} — ${formatDateIt(current.date, current.time)}`);
   }
 
   function showNotification(title, body) {
@@ -1724,7 +1867,7 @@
   function initClearData() {
     document.getElementById('clear-data-btn').addEventListener('click', () => {
       if (confirm('Cancellare TUTTI gli incarichi salvati? Questa azione non è reversibile.')) {
-        Storage.saveEvents([]);
+        Storage.deleteAll(); // tombstone per ogni evento: si cancella anche sugli altri dispositivi
         renderDashboard();
         renderCalendar();
         renderStats();

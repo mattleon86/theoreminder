@@ -1,7 +1,9 @@
-// Funzione serverless Vercel: consente di consultare/recuperare gli snapshot mensili creati da
-// api/backup-events.js, in caso di emergenza (dati principali persi o corrotti).
+// Funzione serverless Vercel: consente di consultare/recuperare gli snapshot mensili degli
+// incarichi, in caso di emergenza (dati principali persi o corrotti).
 // - GET senza parametri  → elenco delle etichette dei backup disponibili (es. "2026-08")
 // - GET ?label=2026-08   → contenuto di quel backup ({ savedAt, events })
+// Il backup mensile viene creato da api/send-reminders.js (il primo giorno del mese, "a bordo"
+// del cron dei promemoria: il piano gratuito di Vercel permette solo 2 Cron per progetto).
 // Stessa autenticazione delle altre API (password del lucchetto == X-Sync-Key == SYNC_SECRET).
 const { kv } = require('@vercel/kv');
 

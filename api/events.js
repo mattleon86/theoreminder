@@ -7,6 +7,9 @@
 const { kv } = require('@vercel/kv');
 
 const EVENTS_KEY = 'theoreminder:events';
+// Tombstone delle eliminazioni { id: ISO }: senza, al prossimo merge un evento cancellato su un
+// dispositivo "risorgerebbe" perché lo salviamo ancora sugli altri (vedi merge in app.js).
+const DELETED_KEY = 'theoreminder:deleted';
 
 function isAuthorized(req) {
   const provided = req.headers['x-sync-key'];
@@ -22,7 +25,8 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'GET') {
     const events = (await kv.get(EVENTS_KEY)) || [];
-    res.status(200).json({ events });
+    const deleted = (await kv.get(DELETED_KEY)) || {};
+    res.status(200).json({ events, deleted });
     return;
   }
 
@@ -33,6 +37,10 @@ module.exports = async function handler(req, res) {
       return;
     }
     await kv.set(EVENTS_KEY, body.events);
+    // `deleted` è opzionale: un client vecchio (che non lo manda) non deve cancellare i tombstone.
+    if (body.deleted && typeof body.deleted === 'object' && !Array.isArray(body.deleted)) {
+      await kv.set(DELETED_KEY, body.deleted);
+    }
     res.status(200).json({ ok: true });
     return;
   }
