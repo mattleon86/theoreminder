@@ -573,20 +573,34 @@ html.locked .lock-screen { display: flex; }
 .fc .fc-col-header-cell { font-size: 0.72rem; font-weight: 700; color: var(--muted); text-transform: capitalize; }
 .fc .fc-daygrid-day-number { color: var(--muted); font-size: 0.78rem; }
 .fc .fc-day-today .fc-daygrid-day-number { color: var(--accent); font-weight: 800; }
-.fc .fc-event {
+/* FullCalendar v6 inietta il proprio CSS a runtime (dopo questo foglio) e colora
+   gli eventi "a tutto giorno" di bianco tramite .fc-h-event .fc-event-main.
+   Per questo: (1) cambiamo la variabile del colore testo e (2) usiamo l'ID
+   #calendar, che ha specificità più alta e vince sempre sull'iniezione. */
+#calendar {
+  --fc-event-text-color: var(--ink);
+}
+#calendar .fc-event {
   background: var(--accent-soft);
   border: 0;
   border-left: 3px solid var(--accent);
   border-radius: 4px;
-  color: var(--accent-dark);
+  color: var(--ink);
   padding: 2px 4px;
-  font-size: 0.76rem;
-  font-weight: 600;
+  font-size: 0.8rem;
+  font-weight: 700;
 }
-.fc .fc-event:hover { background: #d9e9e3; }
-.fc .fc-daygrid-event-dot { display: none; } /* basta la striscia laterale verde */
-.fc .fc-list-event-title { color: var(--ink); }
-.fc .fc-list-event-dot { border-color: var(--accent); }
+#calendar .fc-event .fc-event-main,
+#calendar .fc-event .fc-event-main-frame,
+#calendar .fc-event .fc-event-title,
+#calendar .fc-event .fc-event-time,
+#calendar .fc-list-event-title {
+  color: var(--ink);
+  font-weight: 700;
+}
+#calendar .fc-event:hover { background: #d9e9e3; }
+#calendar .fc-daygrid-event-dot { display: none; } /* basta la striscia laterale verde */
+#calendar .fc-list-event-dot { border-color: var(--accent); }
 
 /* ---------- Statistiche ---------- */
 .bar-chart { display: flex; flex-direction: column; gap: 12px; }
