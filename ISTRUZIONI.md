@@ -10,7 +10,7 @@ Agenda personale degli incarichi di congregazione (PWA, un solo utente). Nessun 
 |---|---|
 | `index.html` | unica pagina: sezioni Dashboard, Carica PDF, Calendario, Statistiche, Impostazioni, schermata di blocco, modale incarico, lightbox |
 | `app.js` | tutta la logica client, in un IIFE: lucchetto, impronta, sync, parser PDF, calendario, promemoria, CSV, statistiche |
-| `style.css` | tema chiaro, mobile-first |
+| `style.css` | design system "agenda editoriale", tema chiaro, mobile-first (nav in basso) / desktop (nav laterale) |
 | `sw.js` | Service Worker: cache `theoreminder-v5` **rete-prima** (l'app si aggiorna da sola; la cache serve solo offline) + gestione notifiche push |
 | `manifest.json`, `icons/` | PWA installabile |
 | `api/*.js` | funzioni serverless Vercel (KV, push, cron, backup) |
@@ -48,3 +48,13 @@ Password confrontata con hash SHA-256 fisso in `app.js` (`LOCK_PASSWORD_HASH`): 
 
 ## 8. Deploy
 `git push` su `main` → Vercel pubblica automaticamente (nessuna build lato frontend). Env da tenere su Vercel: `SYNC_SECRET`, `CRON_SECRET`, `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`.
+
+## 9. Interfaccia (design system)
+Direzione: **agenda editoriale** — carta fredda, inchiostro verde, filetti sottili, un solo elemento protagonista per schermata. Solo tema chiaro (scelta dell'utente: **niente tema scuro**).
+
+- Token in `:root` di `style.css`: `--paper #f5f6f2`, `--ink #16231f`, `--surface #fff`, `--accent #116b58`, `--muted #69766f`, `--line #dbe2dd`, `--amber #a86b18` (solo avvisi), `--danger #a8362b`.
+- Tipi: **Newsreader** (serif) per titoli, numeri e wordmark; **Manrope** (sans) per UI. Vengono da Google Fonts (gratuiti) con fallback di sistema, quindi l'app resta leggibile anche offline.
+- Icone: **SVG inline** con `stroke="currentColor"` in `index.html` (niente emoji nei controlli; le emoji residue generate da `app.js` sono state tolte). Per un'icona nuova, copia lo stile delle altre.
+- Struttura: `.bottom-nav` è barra fissa in basso su mobile e **colonna laterale** da 960 px in su. `main` ha `margin-left: 240px` su desktop. La Dashboard usa `.dashboard-grid` (2 colonne su desktop).
+- Regole: tocco minimo 44 px, focus visibile, `prefers-reduced-motion` rispettato, testi in italiano. Non aggiungere gradienti/ombre multiple o temi scuri: il carattere viene dalla tipografia e dai filetti, non dalla decorazione.
+- Il primo `#upcoming-list .card` è il "prossimo incarico" in evidenza: se cambi la struttura di `renderDashboard()` in `app.js`, aggiorna anche i selettori `:first-child` in `style.css`.

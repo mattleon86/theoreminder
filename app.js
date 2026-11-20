@@ -220,11 +220,11 @@
       }
       btn.disabled = false;
       if (hasFingerprintUnlockSetup()) {
-        statusEl.textContent = '✅ Attiva su questo dispositivo.';
-        btn.textContent = '🚫 Disattiva impronta digitale';
+        statusEl.textContent = 'Attiva su questo dispositivo.';
+        btn.textContent = 'Disattiva impronta digitale';
       } else {
         statusEl.textContent = 'Non attiva su questo dispositivo.';
-        btn.textContent = '👆 Attiva impronta digitale';
+        btn.textContent = 'Attiva impronta digitale';
       }
     }
 
@@ -625,7 +625,7 @@
   function warnIfSameDayConflict(evt) {
     const sameDay = Storage.getEvents().filter((e) => e.date === evt.date);
     if (sameDay.length >= 2) {
-      showToast(`⚠️ Hai più incarichi il ${formatDateIt(evt.date)}`);
+      showToast(`Hai più incarichi il ${formatDateIt(evt.date)}`);
       return true;
     }
     return false;
@@ -667,7 +667,7 @@
     const listEl = document.getElementById('upcoming-list');
     listEl.innerHTML = '';
     if (upcoming.length === 0) {
-      listEl.innerHTML = `<div class="empty-state"><span class="empty-icon">🗓️</span>Nessun incarico in programma.<br>Carica un PDF per iniziare.</div>`;
+      listEl.innerHTML = `<div class="empty-state">Nessun incarico in programma.<br>Carica un PDF per iniziare.</div>`;
       return;
     }
     upcoming.forEach((evt) => {
@@ -1506,11 +1506,11 @@
 
       ${hasSnippet ? `
       <div class="pdf-snippet-wrap">
-        <span class="pdf-snippet-label">📍 Dove è stato letto</span>
+        <span class="pdf-snippet-label">Dove è stato letto</span>
         <img class="pdf-snippet snippet-loading" id="${cardId}-snippet" alt="Punto del PDF da cui è stato estratto questo dato, con il testo evidenziato">
       </div>` : ''}
 
-      <button class="btn-primary btn-block" style="margin-top:14px;" id="${cardId}-save">💾 Salva nel calendario</button>
+      <button class="btn-primary btn-block" style="margin-top:14px;" id="${cardId}-save">Salva nel calendario</button>
     `;
     container.appendChild(card);
 
@@ -1545,7 +1545,7 @@
       Storage.addEvent(evt);
       scheduleReminderForEvent(evt);
       card.style.opacity = '0.5';
-      card.querySelector(`#${cardId}-save`).textContent = '✅ Salvato';
+      card.querySelector(`#${cardId}-save`).textContent = 'Salvato';
       card.querySelector(`#${cardId}-save`).disabled = true;
       renderDashboard();
       if (!warnIfSameDayConflict(evt)) showToast('Incarico salvato nel calendario');
@@ -1750,16 +1750,16 @@
         return;
       }
       if (Notification.permission === 'denied') {
-        statusEl.textContent = '❌ Notifiche bloccate dal browser. Abilitale nelle impostazioni del sito.';
-        btn.textContent = '🔔 Attiva notifiche';
+        statusEl.textContent = 'Notifiche bloccate dal browser. Abilitale nelle impostazioni del sito.';
+        btn.textContent = 'Attiva notifiche';
         return;
       }
       if (isActive()) {
-        statusEl.textContent = '✅ Notifiche attive.';
-        btn.textContent = '🔕 Disattiva notifiche';
+        statusEl.textContent = 'Notifiche attive.';
+        btn.textContent = 'Disattiva notifiche';
       } else {
         statusEl.textContent = 'Notifiche non attive.';
-        btn.textContent = '🔔 Attiva notifiche';
+        btn.textContent = 'Attiva notifiche';
       }
     }
 
@@ -1950,6 +1950,11 @@
   }
 
   function init() {
+    const headerDate = document.getElementById('header-date');
+    if (headerDate) {
+      headerDate.textContent = new Date().toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
+    }
+
     initLockScreen();
     initNavigation();
     initModal();
