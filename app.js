@@ -50,6 +50,8 @@
       input.value = '';
       syncFromServerOnStartup();
       ensurePushSubscription();
+      refreshBackupStatus();
+      openPendingEvent();
     }
 
     async function tryUnlock() {
@@ -257,124 +259,93 @@
      non può eseguirsi dopo una modifica locale appena fatta.
      --------------------------------------------------------------------- */
   const SYNC_ENDPOINT = '/api/events';
-  const TOMBSTONE_TTL_MS = 60 * 24 * 60 * 60 * 1000; // i tombstone delle eliminazioni scadono dopo 60 giorni
+  const BACKUPS_ENDPOINT = '/api/list-backups';
+  const SYNC_TIMEOUT_MS = 12000;
+  const Core = window.TheoCore;
 
   let syncChain = Promise.resolve(); // coda seriale delle operazioni di sync
+  let lastSyncAt = '';
+  let lastSyncError = '';
+  let pendingSync = false;
 
   function getSyncKey() {
     return syncKeyInMemory;
   }
 
-  // Mette in coda un'operazione di sync: parte solo quando tutte le precedenti sono finite,
-  // così una risposta del server non può mai sovrascrivere una modifica locale più recente.
   function enqueueSync(task) {
     syncChain = syncChain.then(task, task);
     return syncChain;
   }
 
-  // Legge lo stato del server: { events, deleted } oppure null (offline / niente chiave).
+  async function fetchWithTimeout(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
+    try {
+      return await fetch(url, Object.assign({}, options, { signal: controller.signal, cache: 'no-store' }));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function setSyncStatus(state, message) {
+    lastSyncError = state === 'error' ? (message || 'Errore di sincronizzazione') : '';
+    if (state === 'ok') {
+      lastSyncAt = new Date().toISOString();
+      pendingSync = false;
+    } else if (state === 'pending') {
+      pendingSync = true;
+    }
+    try {
+      localStorage.setItem('tr_sync_status', JSON.stringify({ lastSyncAt, lastSyncError, pendingSync }));
+    } catch (e) { /* stato visivo opzionale */ }
+    updateSyncStatusUi();
+  }
+
+  function updateSyncStatusUi() {
+    const el = document.getElementById('sync-status');
+    if (el) {
+      if (!getSyncKey()) el.textContent = 'Inserisci la password per sincronizzare.';
+      else if (lastSyncError) el.textContent = lastSyncError;
+      else if (lastSyncAt) el.textContent = 'Ultima sincronizzazione: ' + new Date(lastSyncAt).toLocaleString('it-IT');
+      else el.textContent = pendingSync ? 'Modifiche locali in attesa di sincronizzazione.' : 'Sincronizzazione non ancora verificata.';
+    }
+    const banner = document.getElementById('connection-banner');
+    if (!banner) return;
+    const offline = navigator.onLine === false;
+    const show = !!getSyncKey() && (offline || !!lastSyncError || pendingSync);
+    banner.classList.toggle('hidden', !show);
+    banner.textContent = offline ? 'Offline — le modifiche restano su questo dispositivo.' :
+      (lastSyncError || 'Modifiche locali in attesa di sincronizzazione.');
+  }
+
   async function syncPull() {
     const key = getSyncKey();
     if (!key) return null;
-    try {
-      const res = await fetch(SYNC_ENDPOINT, { headers: { 'X-Sync-Key': key } });
-      if (!res.ok) return null;
-      const data = await res.json();
-      if (!Array.isArray(data.events)) return null;
-      return {
-        events: data.events,
-        deleted: (data.deleted && typeof data.deleted === 'object') ? data.deleted : {}
-      };
-    } catch (e) {
-      return null; // offline, o /api non disponibile (es. in test locali senza Vercel): va bene, resta il locale
-    }
+    const res = await fetchWithTimeout(SYNC_ENDPOINT, { headers: { 'X-Sync-Key': key } });
+    if (res.status === 401) throw new Error('Password di sincronizzazione non valida.');
+    if (!res.ok) throw new Error('Sincronizzazione non riuscita (' + res.status + ').');
+    const data = await res.json();
+    return Core.normalizeState(data);
   }
 
   async function syncPush(state) {
     const key = getSyncKey();
-    if (!key) return;
-    try {
-      await fetch(SYNC_ENDPOINT, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
-        body: JSON.stringify(state)
-      });
-    } catch (e) {
-      // offline: va bene così, il prossimo salvataggio o il polling riproveranno
-    }
-  }
-
-  // "Età" di un incarico: quando è stato modificato l'ultima volta (0 se manca = molto vecchio).
-  function eventStamp(evt) {
-    const t = Date.parse((evt && evt.updatedAt) || '');
-    return isFinite(t) ? t : 0;
-  }
-
-  // Merge tra stato locale e stato del server → { events, deleted }.
-  function mergeSyncState(localEvents, localDeleted, serverEvents, serverDeleted) {
-    const now = Date.now();
-
-    // 1) tombstone: unione, per ogni id tiene quello più recente, scarta quelli scaduti (60 gg)
-    const deleted = {};
-    [localDeleted, serverDeleted].forEach((map) => {
-      Object.keys(map || {}).forEach((id) => {
-        const ts = Date.parse(map[id]);
-        if (!isFinite(ts) || now - ts > TOMBSTONE_TTL_MS) return;
-        if (!deleted[id] || ts > Date.parse(deleted[id])) deleted[id] = map[id];
-      });
+    if (!key) return null;
+    const res = await fetchWithTimeout(SYNC_ENDPOINT, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
+      body: JSON.stringify(Core.normalizeState(state))
     });
-
-    // 2) per ogni id vince la versione con updatedAt più recente
-    const winner = {};
-    const put = (evt) => {
-      if (!evt || !evt.id) return;
-      if (!winner[evt.id] || eventStamp(evt) > eventStamp(winner[evt.id])) winner[evt.id] = evt;
-    };
-    localEvents.forEach(put);
-    (serverEvents || []).forEach(put);
-
-    // 3) le eliminazioni vincono solo se più recenti dell'ultimo aggiornamento dell'evento
-    const isDeleted = (id) => {
-      const tomb = Date.parse(deleted[id]);
-      return isFinite(tomb) && tomb >= eventStamp(winner[id]);
-    };
-
-    // 4) risultato nell'ordine locale, poi gli eventi arrivati dal server (niente duplicati)
-    const merged = [];
-    const seen = {};
-    const addIfAlive = (evt) => {
-      if (!evt || !evt.id || seen[evt.id] || isDeleted(evt.id)) return;
-      seen[evt.id] = 1;
-      merged.push(winner[evt.id]);
-    };
-    localEvents.forEach(addIfAlive);
-    (serverEvents || []).forEach(addIfAlive);
-
-    return { events: merged, deleted };
+    if (!res.ok) throw new Error('Invio delle modifiche non riuscito (' + res.status + ').');
+    return Core.mergeStates({}, await res.json());
   }
 
-  // Confronti "stabili" sul CONTENUTO (indipendenti dall'ordine): senza, due dispositivi con gli
-  // stessi eventi in ordine diverso si rispedirebbero i dati a ogni polling, all'infinito.
-  function sameEventList(a, b) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    const byId = (list) => {
-      const m = {};
-      list.forEach((e) => { if (e && e.id) m[e.id] = e; });
-      return m;
-    };
-    const ma = byId(a);
-    const mb = byId(b);
-    const idsA = Object.keys(ma);
-    if (idsA.length !== Object.keys(mb).length) return false;
-    return idsA.every((id) => JSON.stringify(ma[id]) === JSON.stringify(mb[id]));
+  function mergeSyncState(local, server) {
+    return Core.mergeStates(local, server);
   }
 
-  function sameDeletedMap(a, b) {
-    const ka = Object.keys(a || {}).sort();
-    const kb = Object.keys(b || {}).sort();
-    if (ka.length !== kb.length) return false;
-    return ka.every((k, i) => k === kb[i] && a[k] === b[k]);
-  }
+  function sameEventList(a, b) { return Core.sameEventList(a, b); }
+  function sameDeletedMap(a, b) { return Core.sameDeletedMap(a, b); }
 
   function refreshAllViewsAfterSync() {
     recalcAllReminders();
@@ -383,28 +354,44 @@
     if (document.getElementById('view-calendar').classList.contains('active')) renderCalendar();
   }
 
-  // Applica lo stato unito al localStorage (senza rispedirlo) e aggiorna le viste se è cambiato.
   function applyMergedState(merged, previous) {
     const eventsChanged = !sameEventList(merged.events, previous.events);
     const deletedChanged = !sameDeletedMap(merged.deleted, previous.deleted);
-    if (!eventsChanged && !deletedChanged) return false;
-    localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(merged.events));
-    localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(merged.deleted));
-    if (eventsChanged) refreshAllViewsAfterSync();
+    const clearedChanged = (merged.clearedAt || '') !== (previous.clearedAt || '');
+    if (!eventsChanged && !deletedChanged && !clearedChanged) return false;
+    try {
+      localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(merged.events));
+      localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(merged.deleted));
+      localStorage.setItem(STORAGE_CLEARED_KEY, merged.clearedAt || '');
+    } catch (e) {
+      setSyncStatus('error', 'Impossibile salvare i dati sul dispositivo.');
+      return false;
+    }
+    if (eventsChanged || clearedChanged) refreshAllViewsAfterSync();
     return true;
   }
 
-  // Un'unità di lavoro della sync: pull → merge → eventuale push del risultato.
   async function syncOnce() {
-    const server = await syncPull();
-    if (!server) return; // offline o chiave mancante: resta il locale
-    const local = { events: Storage.getEvents(), deleted: Storage.getDeleted() };
-    const merged = mergeSyncState(local.events, local.deleted, server.events, server.deleted);
-    applyMergedState(merged, local);
-    // Rispediamo solo se il server NON corrisponde più al risultato unito
-    // (tipico: primo avvio, o modifiche fatte offline su questo dispositivo).
-    if (!sameEventList(merged.events, server.events) || !sameDeletedMap(merged.deleted, server.deleted)) {
-      await syncPush(merged);
+    if (!getSyncKey()) return false;
+    setSyncStatus('pending');
+    try {
+      const server = await syncPull();
+      const local = { events: Storage.getEvents(), deleted: Storage.getDeleted(), clearedAt: Storage.getClearedAt() };
+      const merged = mergeSyncState(local, server);
+      applyMergedState(merged, local);
+      let finalState = merged;
+      if (!sameEventList(merged.events, server.events) || !sameDeletedMap(merged.deleted, server.deleted) || (merged.clearedAt || '') !== (server.clearedAt || '')) {
+        const pushed = await syncPush(merged);
+        if (pushed) {
+          finalState = pushed;
+          applyMergedState(pushed, merged);
+        }
+      }
+      setSyncStatus('ok');
+      return true;
+    } catch (e) {
+      setSyncStatus('error', e.message || 'Sincronizzazione non riuscita. Riprovo al prossimo controllo.');
+      return false;
     }
   }
 
@@ -417,6 +404,8 @@
       if (document.hidden) return;
       enqueueSync(syncOnce);
     }, 30000);
+    window.addEventListener('online', () => { setSyncStatus('pending'); enqueueSync(syncOnce); });
+    window.addEventListener('offline', updateSyncStatusUi);
   }
 
   /* ---------------------------------------------------------------------
@@ -424,16 +413,28 @@
      --------------------------------------------------------------------- */
   const STORAGE_EVENTS_KEY = 'tr_events';
   const STORAGE_SETTINGS_KEY = 'tr_settings';
-  const STORAGE_DELETED_KEY = 'tr_deleted'; // tombstone { id: ISO } delle eliminazioni (per la sync)
+  const STORAGE_DELETED_KEY = 'tr_deleted';
+  const STORAGE_CLEARED_KEY = 'tr_cleared_at';
+  const STORAGE_BACKUP_KEY = 'tr_last_local_backup';
 
-  const DEFAULT_SETTINGS = { notificationsEnabled: false };
+  const DEFAULT_SETTINGS = { notificationsEnabled: false, timeZone: 'Europe/Rome' };
 
   const Storage = {
     getEvents() {
       try {
         const raw = localStorage.getItem(STORAGE_EVENTS_KEY);
-        return raw ? JSON.parse(raw) : [];
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        const list = Array.isArray(parsed) ? parsed : Object.values(parsed || {});
+        const normalized = Core.normalizeState({ events: list });
+        if (normalized.events.length !== list.length) {
+          try { localStorage.setItem('tr_events_corrupt', raw); } catch (e) { /* memoria piena */ }
+          console.warn('Alcuni incarichi non validi o duplicati sono stati esclusi.');
+        }
+        return normalized.events;
       } catch (e) {
+        const raw = localStorage.getItem(STORAGE_EVENTS_KEY);
+        if (raw) { try { localStorage.setItem('tr_events_corrupt', raw); } catch (ignore) { /* memoria piena */ } }
         console.error('Errore lettura tr_events', e);
         return [];
       }
@@ -442,82 +443,107 @@
       try {
         const raw = localStorage.getItem(STORAGE_DELETED_KEY);
         const map = raw ? JSON.parse(raw) : {};
-        return (map && typeof map === 'object' && !Array.isArray(map)) ? map : {};
+        return Core.normalizeState({ events: [], deleted: map }).deleted;
       } catch (e) {
         console.error('Errore lettura tr_deleted', e);
         return {};
       }
     },
+    getClearedAt() {
+      const value = localStorage.getItem(STORAGE_CLEARED_KEY) || '';
+      return Core.isValidIso(value) ? value : '';
+    },
     saveEvents(events, opts) {
-      localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(events));
-      // skipSync: true quando i dati arrivano già dal server (li abbiamo appena ricevuti,
-      // rimandarli indietro sarebbe inutile) — vedi syncFromServerOnStartup / startSyncPollingLoop.
-      // Il push non è il "solo stato locale": fa pull+merge+push (syncOnce), così un evento
-      // creato intanto sull'altro dispositivo non viene sovrascritto da questo salvataggio.
+      try {
+        localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(events));
+      } catch (e) {
+        showToast('Impossibile salvare: memoria del dispositivo piena o non disponibile.');
+        return false;
+      }
       if (!(opts && opts.skipSync)) {
+        setSyncStatus('pending');
         enqueueSync(syncOnce);
       }
+      return true;
     },
     addEvent(evt) {
+      evt.updatedAt = new Date().toISOString();
+      if (!Core.validateEvent(evt)) { showToast('Dati dell’incarico non validi'); return null; }
       const events = Storage.getEvents();
-      evt.updatedAt = new Date().toISOString(); // serve al merge: questo dispositivo l'ha creato adesso
       events.push(evt);
-      Storage.saveEvents(events);
-      return evt;
+      return Storage.saveEvents(events) ? evt : null;
     },
     updateEvent(id, patch) {
       const events = Storage.getEvents();
       const idx = events.findIndex((e) => e.id === id);
       if (idx === -1) return null;
-      // Anche le modifiche "piccole" (es. reminderFired) aggiornano updatedAt: è il modo con cui
-      // il merge sa che questa versione è più recente di quella eventualmente sul server.
       patch.updatedAt = new Date().toISOString();
       events[idx] = Object.assign({}, events[idx], patch);
-      Storage.saveEvents(events);
-      return events[idx];
+      if (!Core.validateEvent(events[idx])) { showToast('Dati dell’incarico non validi'); return null; }
+      return Storage.saveEvents(events) ? events[idx] : null;
     },
     deleteEvent(id) {
       const events = Storage.getEvents().filter((e) => e.id !== id);
       // Tombstone: senza, il prossimo merge con il server "risusciterebbe" l'evento eliminato.
       const deleted = Storage.getDeleted();
       deleted[id] = new Date().toISOString();
-      localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted));
-      Storage.saveEvents(events);
+      try { localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted)); } catch (e) { return false; }
+      return Storage.saveEvents(events);
+    },
+    undeleteEvent(evt) {
+      if (!evt) return false;
+      const deleted = Storage.getDeleted();
+      delete deleted[evt.id];
+      try { localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted)); } catch (e) { return false; }
+      evt.updatedAt = new Date(Date.now() + 1).toISOString();
+      return Storage.addEvent(evt);
     },
     // "Cancella tutti i dati": elimina tutto anche sugli altri dispositivi (tombstone per ogni evento).
     deleteAll() {
+      const previous = { events: Storage.getEvents(), deleted: Storage.getDeleted(), clearedAt: Storage.getClearedAt() };
+      try { localStorage.setItem(STORAGE_BACKUP_KEY, JSON.stringify(Core.makeBackup(previous, 'pre-clear'))); } catch (e) { /* backup server tentato separatamente */ }
       const deleted = Storage.getDeleted();
       const now = new Date().toISOString();
-      Storage.getEvents().forEach((e) => { if (e && e.id) deleted[e.id] = now; });
-      localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted));
-      Storage.saveEvents([]);
+      previous.events.forEach((e) => { deleted[e.id] = now; });
+      try {
+        localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(deleted));
+        localStorage.setItem(STORAGE_CLEARED_KEY, now);
+      } catch (e) {
+        showToast('Impossibile aggiornare lo stato di cancellazione.');
+        return false;
+      }
+      return Storage.saveEvents([]);
     },
     getSettings() {
       try {
         const raw = localStorage.getItem(STORAGE_SETTINGS_KEY);
-        return raw ? Object.assign({}, DEFAULT_SETTINGS, JSON.parse(raw)) : Object.assign({}, DEFAULT_SETTINGS);
+        const parsed = raw ? JSON.parse(raw) : {};
+        return Object.assign({}, DEFAULT_SETTINGS, parsed && typeof parsed === 'object' ? parsed : {});
       } catch (e) {
         console.error('Errore lettura tr_settings', e);
         return Object.assign({}, DEFAULT_SETTINGS);
       }
     },
     saveSettings(settings) {
-      localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(settings));
+      try { localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(settings)); return true; }
+      catch (e) { showToast('Impossibile salvare le impostazioni.'); return false; }
     },
     updateSettings(patch) {
       const settings = Object.assign({}, Storage.getSettings(), patch);
-      Storage.saveSettings(settings);
-      return settings;
+      return Storage.saveSettings(settings) ? settings : Storage.getSettings();
+    },
+    exportState() {
+      return Core.makeBackup({ events: Storage.getEvents(), deleted: Storage.getDeleted(), clearedAt: Storage.getClearedAt() }, 'device');
     }
   };
 
   function uuid() {
     if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-      const r = (Math.random() * 16) | 0;
-      const v = c === 'x' ? r : (r & 0x3) | 0x8;
-      return v.toString(16);
-    });
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
   function escapeHtml(str) {
@@ -540,12 +566,17 @@
     navButtons.forEach((btn) => {
       btn.addEventListener('click', () => navigateTo(btn.getAttribute('data-nav-target')));
     });
+    const search = document.getElementById('calendar-search');
+    if (search) search.addEventListener('input', () => { if (calendarInstance) renderCalendar(); });
   }
 
   function navigateTo(viewId) {
     document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === viewId));
     document.querySelectorAll('.nav-btn').forEach((b) => {
-      b.classList.toggle('active', b.getAttribute('data-nav-target') === viewId);
+      const active = b.getAttribute('data-nav-target') === viewId;
+      b.classList.toggle('active', active);
+      if (active) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
     });
     if (viewId === 'view-calendar') renderCalendar();
     if (viewId === 'view-stats') renderStats();
@@ -649,7 +680,7 @@
   function renderDashboard() {
     const events = Storage.getEvents();
     const currentYear = new Date().getFullYear();
-    const yearEvents = events.filter((e) => new Date(e.date).getFullYear() === currentYear);
+    const yearEvents = events.filter((e) => Number(e.date.slice(0, 4)) === currentYear);
     document.getElementById('stat-year-total').textContent = yearEvents.length;
 
     const roleCounts = {};
@@ -671,8 +702,11 @@
       return;
     }
     upcoming.forEach((evt) => {
-      const card = document.createElement('div');
-      card.className = 'card assignment-card';
+      const card = document.createElement('article');
+      card.className = 'card assignment-card upcoming-card';
+      card.setAttribute('role', 'button');
+      card.setAttribute('tabindex', '0');
+      card.setAttribute('aria-label', 'Apri ' + evt.title + ', ' + formatDateIt(evt.date, evt.time));
       card.innerHTML = `
         <span class="badge">${escapeHtml(evt.title)}</span>
         <div class="card-row">
@@ -680,6 +714,9 @@
         </div>
         ${evt.description ? `<p class="small-text">${escapeHtml(evt.description)}</p>` : ''}
       `;
+      const open = () => openEventModal(evt.id);
+      card.addEventListener('click', open);
+      card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
       listEl.appendChild(card);
     });
   }
@@ -691,15 +728,22 @@
 
   function renderCalendar() {
     const calendarEl = document.getElementById('calendar');
-    if (!calendarEl || typeof FullCalendar === 'undefined') return;
+    if (!calendarEl) return;
+    if (typeof FullCalendar === 'undefined') {
+      calendarEl.innerHTML = '<div class="empty-state">Calendario non disponibile. Riapri l’app con una connessione internet.</div>';
+      return;
+    }
 
-    const events = Storage.getEvents().map((e) => ({
-      id: e.id,
-      title: e.title,
-      start: e.time ? `${e.date}T${e.time}` : e.date,
-      allDay: !e.time,
-      extendedProps: { description: e.description || '' }
-    }));
+    const query = (document.getElementById('calendar-search').value || '').trim().toLowerCase();
+    const events = Storage.getEvents()
+      .filter((e) => !query || (e.title + ' ' + (e.description || '')).toLowerCase().includes(query))
+      .map((e) => ({
+        id: e.id,
+        title: e.title,
+        start: e.time ? `${e.date}T${e.time}` : e.date,
+        allDay: !e.time,
+        extendedProps: { description: e.description || '' }
+      }));
 
     if (calendarInstance) {
       calendarInstance.removeAllEvents();
@@ -709,8 +753,14 @@
     }
 
     calendarInstance = new FullCalendar.Calendar(calendarEl, {
-      initialView: 'dayGridMonth',
-      locale: 'it',
+      initialView: window.matchMedia('(max-width: 599px)').matches ? 'listMonth' : 'dayGridMonth',
+      locale: {
+        code: 'it', week: { dow: 1, doy: 4 },
+        buttonText: { prev: 'Prec', next: 'Succ', today: 'Oggi', year: 'Anno', month: 'Mese', week: 'Settimana', day: 'Giorno', list: 'Agenda' },
+        weekText: 'Sm', allDayText: 'Tutto il giorno',
+        moreLinkText: (n) => '+altri ' + n,
+        noEventsText: 'Nessun incarico da visualizzare'
+      },
       firstDay: 1, // settimana da lunedì a domenica
       height: 'auto',
       headerToolbar: { left: 'prev,next today', center: 'title', right: 'dayGridMonth,listMonth' },
@@ -735,6 +785,8 @@
   let editingEventId = null;
   let editingEventOriginal = null; // per capire se data/promemoria sono davvero cambiati al salvataggio
   let editingRevertFn = null; // se aperto da un trascinamento: riporta l'evento alla data originale se annulli
+  let lastFocusedElement = null;
+  let pendingEventId = '';
 
   function openEventModal(eventId, overrideDate, revertFn) {
     // eventId nullo → modalità "nuovo incarico" (aperta dal bottone "+" o da un click su un
@@ -746,6 +798,7 @@
     editingEventId = isNew ? null : eventId;
     editingEventOriginal = evt;
     editingRevertFn = revertFn || null;
+    lastFocusedElement = document.activeElement;
 
     document.getElementById('modal-title-input').value = evt ? evt.title : '';
     document.getElementById('modal-date-input').value = overrideDate || (evt ? evt.date : isoDate(new Date()));
@@ -765,6 +818,13 @@
     document.getElementById('modal-title-input').focus();
   }
 
+  function openPendingEvent() {
+    if (!pendingEventId) return;
+    const id = pendingEventId;
+    pendingEventId = '';
+    if (Storage.getEvents().some((e) => e.id === id)) openEventModal(id);
+  }
+
   function closeEventModal() {
     document.getElementById('event-modal').classList.add('hidden');
     // Chiuso senza salvare dopo un trascinamento: l'evento torna alla data originale nel calendario.
@@ -772,6 +832,8 @@
     editingEventId = null;
     editingEventOriginal = null;
     editingRevertFn = null;
+    if (lastFocusedElement && document.contains(lastFocusedElement)) lastFocusedElement.focus();
+    lastFocusedElement = null;
   }
 
   function saveEventModal() {
@@ -782,6 +844,12 @@
     }
     const reminderType = document.getElementById('modal-reminder-input').value;
     const customDaysInput = document.getElementById('modal-reminder-custom-days');
+    const customDays = parseInt(customDaysInput.value, 10);
+    if (reminderType === 'custom' && (!Number.isInteger(customDays) || customDays < 1 || customDays > 3650)) {
+      showToast('Inserisci almeno 1 giorno per il promemoria personalizzato');
+      customDaysInput.focus();
+      return;
+    }
 
     const patch = {
       title: document.getElementById('modal-title-input').value.trim() || 'Altro',
@@ -790,7 +858,7 @@
       description: document.getElementById('modal-desc-input').value || '',
       reminder: {
         type: reminderType,
-        customDays: reminderType === 'custom' ? (parseInt(customDaysInput.value, 10) || 0) : null
+        customDays: reminderType === 'custom' ? customDays : null
       }
     };
 
@@ -814,9 +882,10 @@
         reminderFired: false,
         createdAt: new Date().toISOString()
       }, patch);
-      Storage.addEvent(saved);
+      saved = Storage.addEvent(saved);
     }
 
+    if (!saved) return;
     if (saved) {
       clearTimeout(reminderTimers[saved.id]);
       scheduleReminderForEvent(saved);
@@ -826,6 +895,8 @@
     document.getElementById('event-modal').classList.add('hidden');
     editingEventId = null;
     editingEventOriginal = null;
+    if (lastFocusedElement && document.contains(lastFocusedElement)) lastFocusedElement.focus();
+    lastFocusedElement = null;
     renderCalendar();
     renderDashboard();
     if (saved && !warnIfSameDayConflict(saved)) showToast('Incarico salvato');
@@ -835,6 +906,18 @@
     document.getElementById('modal-close-btn').addEventListener('click', closeEventModal);
     document.getElementById('event-modal').addEventListener('click', (e) => {
       if (e.target.id === 'event-modal') closeEventModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      const modal = document.getElementById('event-modal');
+      if (modal.classList.contains('hidden')) return;
+      if (e.key === 'Escape') { e.preventDefault(); closeEventModal(); return; }
+      if (e.key !== 'Tab') return;
+      const focusable = Array.from(modal.querySelectorAll('button, input, select, textarea, [tabindex="0"]')).filter((el) => !el.disabled && !el.classList.contains('hidden'));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     });
 
     const reminderSelect = document.getElementById('modal-reminder-input');
@@ -860,8 +943,9 @@
       renderDashboard();
       showToast('Incarico eliminato', 'Annulla', () => {
         if (!deletedEvent) return;
-        Storage.addEvent(deletedEvent);
-        scheduleReminderForEvent(deletedEvent);
+        const restored = Storage.undeleteEvent(deletedEvent);
+        if (!restored) return;
+        scheduleReminderForEvent(restored);
         renderCalendar();
         renderDashboard();
         showToast('Incarico ripristinato');
@@ -873,18 +957,25 @@
   function initSnippetLightbox() {
     const overlay = document.getElementById('image-lightbox');
     const img = document.getElementById('lightbox-img');
+    let lastFocused = null;
+    const close = () => {
+      overlay.classList.add('hidden');
+      if (lastFocused && document.contains(lastFocused)) lastFocused.focus();
+      lastFocused = null;
+    };
     document.addEventListener('click', (e) => {
       const snippet = e.target.closest('.pdf-snippet');
       if (snippet && snippet.src && !snippet.classList.contains('snippet-loading')) {
+        lastFocused = document.activeElement;
         img.src = snippet.src;
         overlay.classList.remove('hidden');
+        document.getElementById('lightbox-close-btn').focus();
       }
     });
-    document.getElementById('lightbox-close-btn').addEventListener('click', () => {
-      overlay.classList.add('hidden');
-    });
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) overlay.classList.add('hidden');
+    document.getElementById('lightbox-close-btn').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !overlay.classList.contains('hidden')) close();
     });
   }
 
@@ -905,6 +996,8 @@
   }
 
   let uploadCardCounter = 0;
+  let isProcessingPdf = false;
+  let lastImportedIds = [];
 
   function initPdfUpload() {
     const input = document.getElementById('pdfInput');
@@ -922,6 +1015,20 @@
       dropZone.classList.remove('drag-over');
       if (e.dataTransfer && e.dataTransfer.files) handleFiles(e.dataTransfer.files);
     });
+
+    document.getElementById('save-all-assignments-btn').addEventListener('click', () => {
+      lastImportedIds = [];
+      const buttons = Array.from(document.querySelectorAll('#assignments-list .assignment-card button')).filter((b) => !b.disabled);
+      buttons.forEach((button) => button.click());
+      if (!lastImportedIds.length) { showToast('Nessun nuovo incarico da salvare'); return; }
+      const ids = lastImportedIds.slice();
+      showToast(`${ids.length} incarichi salvati`, 'Annulla', () => {
+        ids.forEach((id) => Storage.deleteEvent(id));
+        renderCalendar();
+        renderDashboard();
+        showToast('Importazione annullata');
+      });
+    });
   }
 
   async function handleFiles(fileList) {
@@ -929,6 +1036,14 @@
       (f) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name)
     );
     if (files.length === 0) return;
+    if (isProcessingPdf) { showToast('Attendi che l’elaborazione dei PDF sia terminata'); return; }
+    if (files.length > 20 || files.some((f) => f.size > 50 * 1024 * 1024)) {
+      showToast('Massimo 20 file e 50 MB per ogni PDF');
+      return;
+    }
+    isProcessingPdf = true;
+    document.getElementById('pdfInput').disabled = true;
+    document.getElementById('pdf-drop-zone').setAttribute('aria-busy', 'true');
 
     const statusEl = document.getElementById('pdf-status');
     statusEl.classList.remove('hidden');
@@ -964,14 +1079,17 @@
 
     document.getElementById('pdf-preview').value = previewChunks.join('\n\n');
     statusEl.textContent = `${files.length} file elaborati, ${totalMatches} incaric${totalMatches === 1 ? 'o' : 'hi'} individuat${totalMatches === 1 ? 'o' : 'i'}.`;
+    isProcessingPdf = false;
+    document.getElementById('pdfInput').disabled = false;
+    document.getElementById('pdfInput').value = '';
+    document.getElementById('pdf-drop-zone').removeAttribute('aria-busy');
   }
 
   async function extractPdfText(file) {
     if (typeof pdfjsLib === 'undefined') {
       throw new Error('Libreria pdf.js non disponibile (controlla la connessione internet).');
     }
-    pdfjsLib.GlobalWorkerOptions.workerSrc =
-      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdf-3.11.174.pdf.worker.min.js';
 
     const arrayBuffer = await file.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -1052,19 +1170,21 @@
     ctx.closePath();
   }
 
-  const pageCanvasCache = new Map(); // "pdfUniqueId:pageNum" -> canvas renderizzato
+  const pageCanvasCache = new Map(); // cache limitata: le canvas full-page pesano molto sui telefoni
+  const PAGE_CACHE_LIMIT = 6;
 
   async function getRenderedPage(pdf, pageNum) {
     const cacheKey = (pdf.__trId || (pdf.__trId = uuid())) + ':' + pageNum;
     if (pageCanvasCache.has(cacheKey)) return pageCanvasCache.get(cacheKey);
     const page = await pdf.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 3 });
+    const viewport = page.getViewport({ scale: 1.5 });
     const canvas = document.createElement('canvas');
     canvas.width = viewport.width;
     canvas.height = viewport.height;
     await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
     const result = { canvas, viewport };
     pageCanvasCache.set(cacheKey, result);
+    while (pageCanvasCache.size > PAGE_CACHE_LIMIT) pageCanvasCache.delete(pageCanvasCache.keys().next().value);
     return result;
   }
 
@@ -1116,20 +1236,26 @@
     return out.toDataURL('image/png');
   }
 
-  function generateSnippetsAsync(pdf, pairs) {
-    pairs.forEach(({ match, imgEl }) => {
-      if (!imgEl || !match.snippetStrips || !match.snippetStrips.length) return;
-      buildSnippetDataUrl(pdf, match.pageNum, match.snippetStrips)
-        .then((dataUrl) => {
+  async function generateSnippetsAsync(pdf, pairs) {
+    const queue = pairs.filter(({ match, imgEl }) => imgEl && match.snippetStrips && match.snippetStrips.length);
+    let cursor = 0;
+    async function worker() {
+      while (cursor < queue.length) {
+        const { match, imgEl } = queue[cursor++];
+        try {
+          const dataUrl = await buildSnippetDataUrl(pdf, match.pageNum, match.snippetStrips);
           imgEl.src = dataUrl;
           imgEl.classList.remove('snippet-loading');
-        })
-        .catch((err) => {
+        } catch (err) {
           console.error('Errore nella generazione dell\'anteprima PDF', err);
           const wrap = imgEl.closest('.pdf-snippet-wrap');
           if (wrap) wrap.classList.add('hidden');
-        });
-    });
+        }
+      }
+    }
+    await Promise.all([worker(), worker()]);
+    for (const key of [...pageCanvasCache.keys()]) if (key.startsWith(pdf.__trId + ':')) pageCanvasCache.delete(key);
+    if (pdf.destroy) await pdf.destroy().catch(() => {});
   }
 
   /* ----- 5a. Estrazione a colonne (Video/Mixer/Mic+PODIO/Microfono/Sala/Porta/Esterno) -----
@@ -1156,10 +1282,10 @@
     return best;
   }
 
-  function parseShortDate(str) {
+  function parseShortDate(str, preferredYear) {
     const m = (str || '').trim().match(/^(\d{1,2})\/(\d{1,2})$/);
     if (!m) return '';
-    const year = new Date().getFullYear();
+    const year = preferredYear || new Date().getFullYear();
     return `${year}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
   }
 
@@ -1168,7 +1294,7 @@
   const ROW_ASCENT = 9;
   const ROW_DESCENT = 3;
 
-  function tryExtractColumnAssignments(rawItems, pageNum) {
+  function tryExtractColumnAssignments(rawItems, pageNum, preferredYear) {
     const headerItems = [];
     COLUMN_ROLE_LABELS.forEach(({ label, re }) => {
       const hit = rawItems.find((it) => re.test(it.str.trim()));
@@ -1197,9 +1323,10 @@
       return {
         rawLine: `${nearestHeader ? nearestHeader.label : 'Ruolo sconosciuto'} — settimana del ${dateLabel || '?'}`,
         context: 'Ruolo e data individuati dalla posizione nella tabella (colonna e riga più vicine).',
-        guessedDate: parseShortDate(dateLabel),
+        guessedDate: parseShortDate(dateLabel, preferredYear),
         guessedTime: '',
         guessedRole: nearestHeader ? nearestHeader.label : 'Altro',
+        confidence: nearestHeader && nearestDate ? 'media' : 'bassa',
         pageNum,
         // Due fasce: l'intestazione delle colonne in alto, la riga trovata in basso (evidenziata),
         // così l'anteprima resta compatta anche se la riga è in fondo a una tabella lunga.
@@ -1251,8 +1378,7 @@
     for (const { stem, idx } of WEEKDAY_STEMS) {
       if (lower.includes(stem)) {
         const today = new Date();
-        let diff = (idx - today.getDay() + 7) % 7;
-        if (diff === 0) diff = 7;
+        const diff = (idx - today.getDay() + 7) % 7;
         const next = new Date(today.getFullYear(), today.getMonth(), today.getDate() + diff);
         return isoDate(next);
       }
@@ -1260,9 +1386,9 @@
     return '';
   }
 
-  function guessDate(text) {
+  function guessDate(text, preferredYear) {
     if (!text) return '';
-    const year = new Date().getFullYear();
+    const year = preferredYear || new Date().getFullYear();
 
     // 1. Data numerica: gg/mm/aaaa, gg-mm-aaaa, gg/mm/aa
     const numeric = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/);
@@ -1414,39 +1540,31 @@
   }
 
   function findAssignments(pages, filename) {
-    const columnResults = [];
-    let usedColumnExtraction = false;
-
-    pages.forEach(({ rawItems, pageNum }) => {
-      const colMatches = tryExtractColumnAssignments(rawItems, pageNum);
-      if (colMatches) {
-        usedColumnExtraction = true;
-        columnResults.push(...colMatches);
-      }
-    });
-    if (usedColumnExtraction) return columnResults;
-
     const matches = [];
-    pages.forEach(({ pageNum, lines, lineBoxes }) => {
+    const preferredYear = Core.guessYearFromFilename(filename);
+
+    pages.forEach(({ pageNum, lines, lineBoxes, rawItems }) => {
+      const colMatches = tryExtractColumnAssignments(rawItems, pageNum, preferredYear);
+      if (colMatches) {
+        matches.push(...colMatches);
+        return; // questa pagina è una tabella a colonne; le altre pagine restano riga-per-riga
+      }
       const pageText = lines.join(' | ');
       lines.forEach((line, idx) => {
         if (!isPianoLine(line)) return;
         const context = [lines[idx - 2], lines[idx - 1], line, lines[idx + 1], lines[idx + 2]]
           .filter(Boolean).join(' | ');
         const contextIdxs = [idx - 2, idx - 1, idx, idx + 1, idx + 2].filter((i) => i >= 0 && i < lineBoxes.length);
+        const exactDate = guessDate(line, preferredYear) || guessWeekday(line);
+        const contextDate = guessDate(context, preferredYear) || guessWeekday(context);
         matches.push({
           rawLine: line,
           context,
-          // Prova prima sulla riga esatta del match (spesso contiene già la propria data), poi
-          // allarga al contesto/pagina, infine ai giorni della settimana ricorrenti.
-          // Il giorno della settimana va cercato prima sulla riga esatta del match: il contesto
-          // allargato in documenti come "Orari Adunanze Servizio di Campo" elenca tutti i giorni
-          // uno via l'altro, quindi potrebbe contenere un giorno diverso da quello giusto.
-          guessedDate: guessDate(line) || guessWeekday(line) || guessDate(context) || guessWeekday(context) || guessDate(pageText),
+          guessedDate: exactDate || contextDate || guessDate(pageText, preferredYear),
           guessedTime: guessTime(line) || guessTime(context),
           guessedRole: guessRole(line, context, filename),
+          confidence: !exactDate && !contextDate ? 'bassa' : (!guessTime(line) && !guessTime(context) ? 'media' : 'alta'),
           pageNum,
-          // Una sola fascia: il contesto (±2 righe) con la riga esatta del match evidenziata.
           snippetStrips: [
             { box: unionBands(contextIdxs.map((i) => rowBand(lineBoxes[i]))), highlight: rowBand(lineBoxes[idx]) }
           ]
@@ -1471,7 +1589,10 @@
       return [];
     }
 
-    return matches.map((match) => ({ match, imgEl: appendAssignmentCard(section, match, filename) }));
+    return matches.map((match) => {
+      const card = appendAssignmentCard(section, match, filename);
+      return { match, imgEl: card.imgEl, save: card.save };
+    });
   }
 
   function appendAssignmentCard(container, match, sourcePdf) {
@@ -1482,6 +1603,7 @@
     card.className = 'card assignment-card';
     card.innerHTML = `
       <p class="small-text" style="word-break:break-word;">${escapeHtml(match.rawLine)}</p>
+      ${match.confidence === 'bassa' ? '<span class="confidence-badge">Data o ruolo da verificare</span>' : ''}
 
       <label for="${cardId}-title">Ruolo / incarico</label>
       <input type="text" id="${cardId}-title" value="${escapeAttr(match.guessedRole)}" placeholder="Ruolo o incarico">
@@ -1502,7 +1624,7 @@
         <option value="1day" selected>1 giorno prima</option>
         <option value="custom">Personalizzato</option>
       </select>
-      <input type="number" id="${cardId}-custom-days" placeholder="Giorni prima" class="hidden" style="margin-top:8px;" min="1">
+      <input type="number" id="${cardId}-custom-days" placeholder="Giorni prima" class="hidden" style="margin-top:8px;" min="1" max="3650">
 
       ${hasSnippet ? `
       <div class="pdf-snippet-wrap">
@@ -1520,115 +1642,101 @@
       customDaysInput.classList.toggle('hidden', reminderSelect.value !== 'custom');
     });
 
-    card.querySelector(`#${cardId}-save`).addEventListener('click', () => {
+    const saveButton = card.querySelector(`#${cardId}-save`);
+    const save = () => {
+      if (saveButton.disabled) return null;
       const dateVal = card.querySelector(`#${cardId}-date`).value;
-      if (!dateVal) {
+      if (!Core.isValidDate(dateVal)) {
         showToast('Inserisci una data valida prima di salvare');
-        return;
+        return null;
       }
       const titleVal = card.querySelector(`#${cardId}-title`).value.trim() || 'Altro';
+      const timeVal = card.querySelector(`#${cardId}-time`).value || '';
       const reminderType = reminderSelect.value;
+      const customDays = parseInt(customDaysInput.value, 10);
+      if (reminderType === 'custom' && (!Number.isInteger(customDays) || customDays < 1 || customDays > 3650)) {
+        showToast('Inserisci almeno 1 giorno per il promemoria personalizzato');
+        customDaysInput.focus();
+        return null;
+      }
+      const duplicate = Storage.getEvents().some((e) => e.date === dateVal && (e.time || '') === timeVal &&
+        e.title.trim().toLowerCase() === titleVal.toLowerCase() && (e.sourcePdf || '') === sourcePdf);
+      if (duplicate) {
+        showToast('Incarico già presente nel calendario');
+        return null;
+      }
       const evt = {
-        id: uuid(),
-        title: titleVal,
-        date: dateVal,
-        time: card.querySelector(`#${cardId}-time`).value || '',
-        description: card.querySelector(`#${cardId}-desc`).value || '',
-        sourcePdf: sourcePdf,
-        reminder: {
-          type: reminderType,
-          customDays: reminderType === 'custom' ? (parseInt(customDaysInput.value, 10) || 0) : null
-        },
-        reminderFired: false,
-        createdAt: new Date().toISOString()
+        id: uuid(), title: titleVal, date: dateVal, time: timeVal,
+        description: card.querySelector(`#${cardId}-desc`).value || '', sourcePdf,
+        reminder: { type: reminderType, customDays: reminderType === 'custom' ? customDays : null },
+        reminderFired: false, createdAt: new Date().toISOString()
       };
-      Storage.addEvent(evt);
-      scheduleReminderForEvent(evt);
+      const saved = Storage.addEvent(evt);
+      if (!saved) return null;
+      lastImportedIds.push(saved.id);
+      scheduleReminderForEvent(saved);
       card.style.opacity = '0.5';
-      card.querySelector(`#${cardId}-save`).textContent = 'Salvato';
-      card.querySelector(`#${cardId}-save`).disabled = true;
+      saveButton.textContent = 'Salvato';
+      saveButton.disabled = true;
       renderDashboard();
-      if (!warnIfSameDayConflict(evt)) showToast('Incarico salvato nel calendario');
+      return saved;
+    };
+    saveButton.addEventListener('click', () => {
+      const saved = save();
+      if (saved && !warnIfSameDayConflict(saved)) showToast('Incarico salvato nel calendario');
     });
 
-    return hasSnippet ? card.querySelector(`#${cardId}-snippet`) : null;
+    return { imgEl: hasSnippet ? card.querySelector(`#${cardId}-snippet`) : null, save };
   }
 
   /* ---------------------------------------------------------------------
      7. MOTORE PROMEMORIA / NOTIFICHE
      --------------------------------------------------------------------- */
   const reminderTimers = {}; // eventId -> timeoutId
-  const REMINDER_DAYS = { '3days': 3, '1day': 1 };
-  const MISSED_WINDOW_MS = 12 * 60 * 60 * 1000; // 12h: recupera promemoria mancati entro questa finestra
-
-  function getReminderOffsetMs(reminder) {
-    if (!reminder || reminder.type === 'none') return null;
-    const days = reminder.type === 'custom' ? (reminder.customDays || 0) : REMINDER_DAYS[reminder.type];
-    if (!days) return null;
-    return days * 24 * 60 * 60 * 1000;
-  }
+  const MISSED_WINDOW_MS = 12 * 60 * 60 * 1000;
+  const FIRED_DEDUP_MS = 24 * 60 * 60 * 1000;
 
   function scheduleReminderForEvent(evt) {
-    if (evt.reminderFired) return;
-    const offset = getReminderOffsetMs(evt.reminder);
-    if (offset === null) return;
-
-    const eventTime = new Date(evt.date + 'T' + (evt.time || '00:00')).getTime();
-    const fireTime = eventTime - offset;
-    const now = Date.now();
-    const delay = fireTime - now;
-
+    if (!evt || evt.reminderFired || Core.getReminderDays(evt.reminder) == null) return;
+    const fireTime = Core.reminderFireTime(evt, Storage.getSettings().timeZone);
+    const delay = fireTime - Date.now();
     if (delay < 0) {
-      // Promemoria nel passato: se rientra nella finestra "mancati", mostralo subito.
-      if (delay > -MISSED_WINDOW_MS) {
-        fireReminder(evt);
-      }
+      if (delay > -MISSED_WINDOW_MS) fireReminder(evt);
       return;
     }
-
-    // setTimeout ha un limite massimo (~24.8 giorni); per delay molto lunghi usiamo il loop di controllo periodico.
     if (delay < 24 * 60 * 60 * 1000) {
       clearTimeout(reminderTimers[evt.id]);
       reminderTimers[evt.id] = setTimeout(() => fireReminder(evt), delay);
     }
   }
 
-  // Finestra entro la quale un promemoria già inviato blocca un reinvio dall'altro motore
-  // (client o cron server): serve se uno dei due era offline e il flag arriva in ritardo.
-  const FIRED_DEDUP_MS = 24 * 60 * 60 * 1000;
-
-  function fireReminder(evt) {
+  async function fireReminder(evt) {
     const current = Storage.getEvents().find((e) => e.id === evt.id);
     if (!current || current.reminderFired) return;
     const firedAt = Date.parse(current.reminderFiredAt || '');
     if (isFinite(firedAt) && Date.now() - firedAt < FIRED_DEDUP_MS) return;
-    // Notifiche disattivate dall'utente: non consumare il promemoria (non segnarlo come "fatto"),
-    // così se le riattiva più tardi il controllo periodico lo recupera comunque (entro 12h).
-    if (!Storage.getSettings().notificationsEnabled) return;
+    if (!Storage.getSettings().notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
 
-    // 1) PRIMA si marca il promemoria come inviato: updateEvent accoda anche il push al server,
-    //    così il cron Vercel (quando sta per girare alle 06:00/18:00 UTC) vede il flag e non
-    //    invia la stessa notifica due volte.
-    Storage.updateEvent(current.id, { reminderFired: true, reminderFiredAt: new Date().toISOString() });
-
-    // 2) Poi si mostra la notifica locale.
-    showNotification('Promemoria incarico', `${current.title} — ${formatDateIt(current.date, current.time)}`);
+    const marked = Storage.updateEvent(current.id, { reminderFired: true, reminderFiredAt: new Date().toISOString() });
+    if (!marked) return;
+    const shown = await showNotification('Promemoria incarico', `${current.title} — ${formatDateIt(current.date, current.time)}`, { data: { eventId: current.id } });
+    if (!shown) Storage.updateEvent(current.id, { reminderFired: false, reminderFiredAt: null });
   }
 
-  function showNotification(title, body) {
-    if (Notification.permission !== 'granted') return;
-    if (navigator.serviceWorker && navigator.serviceWorker.ready) {
-      navigator.serviceWorker.ready.then((reg) => {
-        if (reg && reg.showNotification) {
-          reg.showNotification(title, { body, icon: './icons/icon-192.png', badge: './icons/icon-192.png' });
-        } else {
-          new Notification(title, { body, icon: './icons/icon-192.png' });
-        }
-      }).catch(() => {
-        new Notification(title, { body, icon: './icons/icon-192.png' });
-      });
-    } else {
-      new Notification(title, { body, icon: './icons/icon-192.png' });
+  async function showNotification(title, body, options) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return false;
+    const opts = Object.assign({ body, icon: './icons/icon-192.png', badge: './icons/icon-192.png', data: {} }, options || {});
+    if (opts.data && opts.data.eventId) opts.actions = [{ action: 'open', title: 'Apri incarico' }];
+    try {
+      if (navigator.serviceWorker) {
+        const reg = await navigator.serviceWorker.ready;
+        if (reg && reg.showNotification) { await reg.showNotification(title, opts); return true; }
+      }
+      new Notification(title, opts);
+      return true;
+    } catch (e) {
+      console.error('Notifica locale non mostrata', e);
+      return false;
     }
   }
 
@@ -1657,7 +1765,7 @@
     const key = getSyncKey();
     if (!key) return false; // serve la password per autenticarsi alle API server
     try {
-      const keyRes = await fetch(VAPID_KEY_ENDPOINT, { headers: { 'X-Sync-Key': key } });
+      const keyRes = await fetchWithTimeout(VAPID_KEY_ENDPOINT, { headers: { 'X-Sync-Key': key } });
       if (!keyRes.ok) return false;
       const { publicKey } = await keyRes.json();
       if (!publicKey) return false;
@@ -1670,35 +1778,36 @@
           applicationServerKey: urlBase64ToUint8Array(publicKey)
         });
       }
-      await fetch(PUSH_SUBSCRIBE_ENDPOINT, {
+      const res = await fetchWithTimeout(PUSH_SUBSCRIBE_ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
         body: JSON.stringify({ subscription: sub.toJSON() })
       });
-      return true;
+      return res.ok;
     } catch (e) {
       return false; // offline, permesso negato dal sistema, o /api non disponibile (es. test locali senza Vercel)
     }
   }
 
   async function unsubscribeFromPush() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return true;
     try {
       const reg = await navigator.serviceWorker.ready;
       const sub = await reg.pushManager.getSubscription();
-      if (!sub) return;
-      const endpoint = sub.endpoint;
-      await sub.unsubscribe();
+      if (!sub) return true;
       const key = getSyncKey();
       if (key) {
-        await fetch(PUSH_SUBSCRIBE_ENDPOINT, {
+        const res = await fetchWithTimeout(PUSH_SUBSCRIBE_ENDPOINT, {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
-          body: JSON.stringify({ endpoint })
+          body: JSON.stringify({ endpoint: sub.endpoint })
         });
+        if (!res.ok) return false;
       }
+      await sub.unsubscribe();
+      return true;
     } catch (e) {
-      // va bene comunque: se la sottoscrizione resta orfana, il server la ripulisce al primo invio fallito
+      return false;
     }
   }
 
@@ -1723,14 +1832,7 @@
       const events = Storage.getEvents();
       const now = Date.now();
       events.forEach((evt) => {
-        if (evt.reminderFired) return;
-        const offset = getReminderOffsetMs(evt.reminder);
-        if (offset === null) return;
-        const eventTime = new Date(evt.date + 'T' + (evt.time || '00:00')).getTime();
-        const fireTime = eventTime - offset;
-        if (now >= fireTime && now - fireTime < MISSED_WINDOW_MS) {
-          fireReminder(evt);
-        }
+        if (Core.isReminderDue(evt, now, MISSED_WINDOW_MS, settings.timeZone)) fireReminder(evt);
       });
     }, 25000);
   }
@@ -1767,32 +1869,38 @@
       if (!('Notification' in window)) return;
 
       if (isActive()) {
-        // Il permesso del browser resta "concesso" (nessuna API JS può revocarlo): disattiviamo
-        // solo a livello di app, che è quello che conta per smettere di ricevere promemoria.
+        const removed = await unsubscribeFromPush();
+        if (!removed) { showToast('Non è stato possibile disattivare il push remoto. Riprova.'); return; }
         Storage.updateSettings({ notificationsEnabled: false });
-        unsubscribeFromPush();
         showToast('Notifiche disattivate');
         updateStatus();
         return;
       }
 
-      if (Notification.permission === 'granted') {
+      let permission = Notification.permission;
+      if (permission !== 'granted') permission = await Notification.requestPermission();
+      if (permission === 'granted') {
         Storage.updateSettings({ notificationsEnabled: true });
         recalcAllReminders();
-        await subscribeToPush();
-        showToast('Notifiche attivate');
+        const pushOk = await subscribeToPush();
+        showToast(pushOk ? 'Notifiche attivate' : 'Notifiche locali attive; push remoto non registrato');
+        updateStatus();
+        if (!pushOk) statusEl.textContent = 'Notifiche locali attive, ma il push remoto non è stato registrato.';
+        return;
       } else {
-        const permission = await Notification.requestPermission();
-        if (permission === 'granted') {
-          Storage.updateSettings({ notificationsEnabled: true });
-          recalcAllReminders();
-          await subscribeToPush();
-          showToast('Notifiche attivate');
-        } else {
-          showToast('Permesso notifiche non concesso');
-        }
+        showToast('Permesso notifiche non concesso');
       }
       updateStatus();
+    });
+
+    const testBtn = document.getElementById('test-notification-btn');
+    if (testBtn) testBtn.addEventListener('click', async () => {
+      if (!('Notification' in window) || Notification.permission !== 'granted') {
+        showToast('Concedi prima il permesso alle notifiche');
+        return;
+      }
+      const shown = await showNotification('TheoReminder', 'Le notifiche funzionano correttamente.');
+      showToast(shown ? 'Notifica di prova inviata' : 'Notifica non riuscita');
     });
 
     updateStatus();
@@ -1815,12 +1923,6 @@
     return `${d}/${m}/${y}`;
   }
 
-  function csvEscape(val) {
-    const s = String(val == null ? '' : val);
-    if (/[;"\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
-    return s;
-  }
-
   function generateCsv(events) {
     const header = ['Data', 'Ora', 'Ruolo/Incarico', 'Descrizione', 'Promemoria', 'File PDF di origine'];
     const sorted = events.slice().sort((a, b) => {
@@ -1837,7 +1939,7 @@
       e.sourcePdf || ''
     ]);
     // Punto e virgola come separatore + BOM UTF-8: apertura diretta e corretta in Excel italiano.
-    const lines = [header, ...rows].map((cols) => cols.map(csvEscape).join(';'));
+    const lines = [header, ...rows].map((cols) => cols.map(Core.csvCell).join(';'));
     return '﻿' + lines.join('\r\n');
   }
 
@@ -1864,16 +1966,100 @@
     showToast('File CSV scaricato');
   }
 
-  function initClearData() {
-    document.getElementById('clear-data-btn').addEventListener('click', () => {
-      if (confirm('Cancellare TUTTI gli incarichi salvati? Questa azione non è reversibile.')) {
-        Storage.deleteAll(); // tombstone per ogni evento: si cancella anche sugli altri dispositivi
-        renderDashboard();
-        renderCalendar();
-        renderStats();
-        showToast('Dati cancellati');
+  async function createServerBackup() {
+    const key = getSyncKey();
+    if (!key) return false;
+    try {
+      const res = await fetchWithTimeout(BACKUPS_ENDPOINT, { method: 'POST', headers: { 'X-Sync-Key': key } });
+      if (!res.ok) return false;
+      await refreshBackupStatus();
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function refreshBackupStatus() {
+    const el = document.getElementById('backup-status');
+    if (!el) return;
+    try {
+      const res = await fetchWithTimeout(BACKUPS_ENDPOINT, { headers: { 'X-Sync-Key': getSyncKey() } });
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      const last = data.lastBackupAt || (data.lastBackup && data.lastBackup.savedAt) || (data.backups && data.backups[0] && data.backups[0].savedAt);
+      el.textContent = last ? 'Ultimo backup: ' + new Date(last).toLocaleString('it-IT') : 'Nessun backup cloud ancora disponibile.';
+    } catch (e) {
+      el.textContent = 'Backup automatico mensile; stato cloud non disponibile.';
+    }
+  }
+
+  function exportJsonBackup() {
+    const backup = Storage.exportState();
+    downloadBlob(JSON.stringify(backup, null, 2), 'theoreminder-backup-' + new Date().toISOString().slice(0, 10) + '.json', 'application/json');
+    showToast('Backup JSON esportato');
+  }
+
+  async function importJsonBackup(file) {
+    if (!file) return;
+    try {
+      if (file.size > 10 * 1024 * 1024) throw new Error('File troppo grande');
+      const data = JSON.parse(await file.text());
+      if (!data || data.app !== 'TheoReminder' || !Array.isArray(data.events)) throw new Error('Backup non valido');
+      const incoming = Core.normalizeState(data);
+      const local = { events: Storage.getEvents(), deleted: Storage.getDeleted(), clearedAt: Storage.getClearedAt() };
+      const merged = Core.mergeStates(local, incoming);
+      localStorage.setItem(STORAGE_EVENTS_KEY, JSON.stringify(merged.events));
+      localStorage.setItem(STORAGE_DELETED_KEY, JSON.stringify(merged.deleted));
+      localStorage.setItem(STORAGE_CLEARED_KEY, merged.clearedAt || '');
+      refreshAllViewsAfterSync();
+      enqueueSync(syncOnce);
+      showToast(`Backup importato: ${incoming.events.length} incarichi validi`);
+    } catch (e) {
+      showToast('Importazione fallita: ' + e.message);
+    } finally {
+      document.getElementById('import-json-input').value = '';
+    }
+  }
+
+  function initDataTools() {
+    document.getElementById('create-backup-btn').addEventListener('click', async () => {
+      const ok = await createServerBackup();
+      showToast(ok ? 'Backup creato' : 'Backup cloud non riuscito');
+    });
+    document.getElementById('export-json-btn').addEventListener('click', exportJsonBackup);
+    document.getElementById('restore-local-backup-btn').addEventListener('click', () => {
+      const raw = localStorage.getItem(STORAGE_BACKUP_KEY);
+      if (!raw) return;
+      try {
+        const backup = JSON.parse(raw);
+        const now = new Date().toISOString();
+        backup.events = backup.events.map((evt) => Object.assign({}, evt, { updatedAt: now }));
+        importJsonBackup(new File([JSON.stringify(backup)], 'backup-locale.json', { type: 'application/json' }));
+      } catch (e) {
+        showToast('Backup locale non leggibile');
       }
     });
+    document.getElementById('restore-local-backup-btn').classList.toggle('hidden', !localStorage.getItem(STORAGE_BACKUP_KEY));
+    document.getElementById('import-json-input').addEventListener('change', (e) => importJsonBackup(e.target.files[0]));
+    document.getElementById('clear-data-btn').addEventListener('click', async () => {
+      if (!confirm('Cancellare TUTTI gli incarichi salvati, anche sugli altri dispositivi?')) return;
+      const button = document.getElementById('clear-data-btn');
+      button.disabled = true;
+      const backupOk = await createServerBackup();
+      if (!backupOk && !confirm('Il backup cloud non è riuscito. Cancellare comunque? È stato conservato un backup locale.')) {
+        button.disabled = false;
+        return;
+      }
+      const ok = Storage.deleteAll();
+      button.disabled = false;
+      if (!ok) return;
+      renderDashboard();
+      renderCalendar();
+      renderStats();
+      document.getElementById('restore-local-backup-btn').classList.remove('hidden');
+      showToast('Dati cancellati');
+    });
+    if (getSyncKey()) refreshBackupStatus();
   }
 
   /* ---------------------------------------------------------------------
@@ -1908,7 +2094,7 @@
     document.getElementById('stats-total').textContent = events.length;
     const currentYear = new Date().getFullYear();
     document.getElementById('stats-year').textContent = events.filter(
-      (e) => new Date(e.date).getFullYear() === currentYear
+      (e) => Number(e.date.slice(0, 4)) === currentYear
     ).length;
 
     const byMonth = {};
@@ -1918,10 +2104,19 @@
       const label = `${MONTHS_IT[d.getMonth()]} ${d.getFullYear()}`;
       byMonth[label] = (byMonth[label] || 0) + 1;
     });
-    renderBarChart('stats-by-month', byMonth);
+    const sortedMonths = {};
+    Object.entries(byMonth).sort(([a], [b]) => {
+      const [ma, ya] = a.split(' ');
+      const [mb, yb] = b.split(' ');
+      return Number(ya) - Number(yb) || MONTHS_IT.indexOf(ma) - MONTHS_IT.indexOf(mb);
+    }).forEach(([label, value]) => { sortedMonths[label] = value; });
+    renderBarChart('stats-by-month', sortedMonths);
 
     const byRole = {};
-    events.forEach((e) => { byRole[e.title] = (byRole[e.title] || 0) + 1; });
+    events.forEach((e) => {
+      const role = e.title.trim().replace(/\s+/g, ' ').toLowerCase();
+      byRole[role] = (byRole[role] || 0) + 1;
+    });
     renderBarChart('stats-by-role', byRole);
   }
 
@@ -1939,7 +2134,7 @@
         if (event.data && event.data.type === 'push-resubscribed') {
           const key = getSyncKey();
           if (!key) return;
-          fetch(PUSH_SUBSCRIBE_ENDPOINT, {
+          fetchWithTimeout(PUSH_SUBSCRIBE_ENDPOINT, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Sync-Key': key },
             body: JSON.stringify({ subscription: event.data.subscription })
@@ -1950,6 +2145,15 @@
   }
 
   function init() {
+    try {
+      const status = JSON.parse(localStorage.getItem('tr_sync_status') || '{}');
+      lastSyncAt = status.lastSyncAt || '';
+      lastSyncError = status.lastSyncError || '';
+      pendingSync = !!status.pendingSync;
+    } catch (e) { /* stato opzionale */ }
+    const eventMatch = location.hash.match(/^#event=(.+)$/);
+    if (eventMatch) pendingEventId = decodeURIComponent(eventMatch[1]);
+
     const headerDate = document.getElementById('header-date');
     if (headerDate) {
       headerDate.textContent = new Date().toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long' });
@@ -1962,7 +2166,7 @@
     initPdfUpload();
     initNotifications();
     initSecuritySettings();
-    initClearData();
+    initDataTools();
     registerServiceWorker();
 
     document.getElementById('export-csv-btn').addEventListener('click', exportCsv);
@@ -1975,6 +2179,7 @@
     // se l'app è ancora bloccata, ci riproverà appena l'utente inserisce la password (vedi initLockScreen).
     syncFromServerOnStartup();
     startSyncPollingLoop();
+    updateSyncStatusUi();
   }
 
   if (document.readyState === 'loading') {

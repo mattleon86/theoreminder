@@ -1,138 +1,101 @@
-// Funzione serverless Vercel invocata dal Cron di Vercel (vedi vercel.json): controlla gli
-// incarichi salvati e invia una notifica Web Push "vera" per quelli il cui promemoria è dovuto,
-// anche se l'app non è aperta su nessun dispositivo. Questo sostituisce/affianca il motore a
-// setTimeout lato client (app.js), che funziona solo con la scheda/app aperta.
-//
-// Approfitta anche di questa stessa esecuzione per fare, una volta al mese, un backup separato
-// degli incarichi (vedi backupIfDue): il piano gratuito di Vercel permette solo 2 Cron Job per
-// progetto e li usiamo già entrambi per i promemoria, quindi il backup mensile viaggia "a bordo"
-// di questa funzione invece di averne una terza dedicata.
-const { kv } = require('@vercel/kv');
-const webpush = require('web-push');
+'use strict';
 
-const EVENTS_KEY = 'theoreminder:events';
-const SUBS_KEY = 'theoreminder:push-subscriptions';
-const BACKUP_PREFIX = 'theoreminder:events-backup:';
-const BACKUP_INDEX_KEY = 'theoreminder:events-backup-index';
-const KEEP_BACKUPS = 12; // ~1 anno di storico mensile
-const REMINDER_DAYS = { '3days': 3, '1day': 1 };
-// Il piano gratuito di Vercel esegue i Cron Job al massimo una volta al giorno per job (qui ne
-// usiamo due, mattina e sera: vedi vercel.json). Finestra più larga di quella usata dal motore
-// lato client (12h) per non perdere un promemoria tra un'esecuzione e l'altra.
+const webpush = require('web-push');
+const core = require('../shared/core');
+const { requireCronSecret } = require('../lib/auth');
+const store = require('../lib/store');
+
 const MISSED_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-function isAuthorized(req) {
-  // Quando la variabile d'ambiente CRON_SECRET è impostata su Vercel, le chiamate generate dal
-  // Cron di Vercel includono automaticamente questo header: così solo Vercel (o chi conosce il
-  // segreto) può invocare l'invio dei promemoria.
-  const expected = process.env.CRON_SECRET;
-  if (!expected) return false;
-  return req.headers['authorization'] === `Bearer ${expected}`;
-}
-
-function getReminderOffsetMs(reminder) {
-  if (!reminder || reminder.type === 'none') return null;
-  const days = reminder.type === 'custom' ? (reminder.customDays || 0) : REMINDER_DAYS[reminder.type];
-  if (!days) return null;
-  return days * 24 * 60 * 60 * 1000;
-}
-
 function formatDateIt(dateStr, time) {
-  if (!dateStr) return '';
   const [y, m, d] = dateStr.split('-');
   return `${d}/${m}/${y}${time ? ' alle ' + time : ''}`;
 }
 
-// Salva uno snapshot degli incarichi una volta al mese (idempotente: se rieseguito più volte lo
-// stesso giorno sovrascrive semplicemente lo snapshot del mese corrente) e tiene solo gli ultimi
-// KEEP_BACKUPS mesi. Serve come rete di sicurezza se theoreminder:events si rompe o si svuota per
-// errore: consultabile/recuperabile da api/list-backups.js.
-async function backupIfDue(events) {
-  const now = new Date();
-  if (now.getUTCDate() !== 1) return; // solo il primo giorno del mese (UTC)
-
-  const label = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-  await kv.set(`${BACKUP_PREFIX}${label}`, { savedAt: now.toISOString(), events });
-
-  const index = (await kv.get(BACKUP_INDEX_KEY)) || [];
-  if (!index.includes(label)) index.push(label);
-  index.sort();
-  while (index.length > KEEP_BACKUPS) {
-    const oldest = index.shift();
-    await kv.del(`${BACKUP_PREFIX}${oldest}`);
+function endpointHost(endpoint) {
+  try {
+    return new URL(endpoint).host;
+  } catch (_) {
+    return '';
   }
-  await kv.set(BACKUP_INDEX_KEY, index);
 }
 
 module.exports = async function handler(req, res) {
-  if (!isAuthorized(req)) {
-    res.status(401).json({ error: 'Non autorizzato' });
-    return;
-  }
+  if (!requireCronSecret(req, res)) return;
 
-  const vapidPublic = process.env.VAPID_PUBLIC_KEY;
-  const vapidPrivate = process.env.VAPID_PRIVATE_KEY;
-  if (!vapidPublic || !vapidPrivate) {
-    res.status(500).json({ error: 'VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY non configurate sul server' });
-    return;
-  }
-  webpush.setVapidDetails('mailto:matteoester.piano@gmail.com', vapidPublic, vapidPrivate);
+  let events = 0;
+  let deliveries = 0;
+  let backupInfo = null;
+  try {
+    const state = await store.getState();
+    try {
+      const backup = await store.createBackup(state, store.monthlyBackupLabel(), 'cron');
+      backupInfo = { label: backup.label, created: backup.created };
+    } catch (_) {
+      console.error('Backup automatico non riuscito');
+    }
 
-  const events = (await kv.get(EVENTS_KEY)) || [];
-  await backupIfDue(events);
+    const now = Date.now();
+    const due = state.events.filter((evt) => core.isReminderDue(evt, now, MISSED_WINDOW_MS, core.DEFAULT_TIME_ZONE));
+    events = due.length;
 
-  let subs = (await kv.get(SUBS_KEY)) || [];
-  if (subs.length === 0) {
-    res.status(200).json({ ok: true, sent: 0, note: 'Nessun dispositivo sottoscritto' });
-    return;
-  }
+    const vapidPublic = process.env.VAPID_PUBLIC_KEY;
+    const vapidPrivate = process.env.VAPID_PRIVATE_KEY;
+    if (!vapidPublic || !vapidPrivate) {
+      res.status(500).json({
+        error: 'VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY non configurate sul server',
+        events, deliveries, backup: backupInfo
+      });
+      return;
+    }
+    if (due.length === 0) {
+      res.status(200).json({ ok: true, events, deliveries, marked: 0, failures: 0, removedSubscriptions: 0, backup: backupInfo });
+      return;
+    }
 
-  const now = Date.now();
-  const due = events.filter((evt) => {
-    if (evt.reminderFired) return false;
-    // Anti-doppia notifica: se il motore lato client (app aperta) l'ha già inviato, ma per un
-    // problema di rete il flag è arrivato in ritardo o si è perso, il timestamp blocca il reinvio.
-    const firedAt = Date.parse(evt.reminderFiredAt || '');
-    if (isFinite(firedAt) && now - firedAt < MISSED_WINDOW_MS) return false;
-    const offset = getReminderOffsetMs(evt.reminder);
-    if (offset === null) return false;
-    const eventTime = new Date(evt.date + 'T' + (evt.time || '00:00')).getTime();
-    const fireTime = eventTime - offset;
-    return now >= fireTime && now - fireTime < MISSED_WINDOW_MS;
-  });
+    webpush.setVapidDetails('mailto:matteoester.piano@gmail.com', vapidPublic, vapidPrivate);
+    const subscriptions = await store.listSubscriptions();
+    const deadEndpoints = new Set();
+    const successful = [];
+    let failures = 0;
+    const firedAt = new Date(now).toISOString();
 
-  if (due.length === 0) {
-    res.status(200).json({ ok: true, sent: 0 });
-    return;
-  }
-
-  const deadEndpoints = new Set();
-  for (const evt of due) {
-    const payload = JSON.stringify({
-      title: 'Promemoria incarico',
-      body: `${evt.title} — ${formatDateIt(evt.date, evt.time)}`
-    });
-    // Marchia PRIMA l'invio nel KV (prima di aspettare la consegna): se l'app rilegge lo stato
-    // durante l'invio, non deve poter rispedire la stessa notifica dal motore client.
-    evt.reminderFired = true;
-    evt.reminderFiredAt = new Date().toISOString();
-    await Promise.all(subs.map(async (sub) => {
-      try {
-        await webpush.sendNotification(sub, payload);
-      } catch (err) {
-        // 404/410 = sottoscrizione scaduta o revocata dal browser: la ripuliamo sotto.
-        if (err && (err.statusCode === 404 || err.statusCode === 410)) {
-          deadEndpoints.add(sub.endpoint);
+    for (const evt of due) {
+      const payload = JSON.stringify({
+        title: 'Promemoria incarico',
+        body: `${evt.title} — ${formatDateIt(evt.date, evt.time)}`,
+        eventId: evt.id,
+        date: evt.date,
+        actions: [{ action: 'open', title: 'Apri incarico' }]
+      });
+      let delivered = false;
+      await Promise.all(subscriptions.map(async (subscription) => {
+        try {
+          await webpush.sendNotification(subscription, payload);
+          deliveries += 1;
+          delivered = true;
+        } catch (err) {
+          failures += 1;
+          const statusCode = Number(err && err.statusCode) || 0;
+          if (statusCode === 404 || statusCode === 410) deadEndpoints.add(subscription.endpoint);
+          console.warn('Push non consegnato', { statusCode, host: endpointHost(subscription.endpoint) });
         }
+      }));
+      if (delivered) successful.push({ id: evt.id, date: evt.date, time: evt.time || '', reminder: evt.reminder });
+    }
+
+    let removedSubscriptions = 0;
+    if (deadEndpoints.size > 0) {
+      try {
+        removedSubscriptions = await store.removeSubscriptions([...deadEndpoints]);
+      } catch (_) {
+        console.error('Pulizia sottoscrizioni non riuscita');
       }
-    }));
+    }
+    const marked = await store.markRemindersFired(successful, firedAt);
+    res.status(200).json({ ok: true, events, deliveries, marked, failures, removedSubscriptions, backup: backupInfo });
+  } catch (_) {
+    console.error('Invio promemorie non riuscito');
+    res.status(500).json({ error: "Errore interno durante l'invio dei promemoria", events, deliveries, backup: backupInfo });
   }
-
-  if (deadEndpoints.size > 0) {
-    subs = subs.filter((s) => !deadEndpoints.has(s.endpoint));
-    await kv.set(SUBS_KEY, subs);
-  }
-
-  await kv.set(EVENTS_KEY, events);
-  res.status(200).json({ ok: true, sent: due.length });
 };

@@ -1,49 +1,42 @@
-// Funzione serverless Vercel: salva/legge gli incarichi di Matteo Piano su un archivio condiviso
-// (Vercel KV), così l'app può sincronizzarsi tra più dispositivi.
-//
-// Autenticazione semplice: la stessa password del lucchetto dell'app viene inviata in ogni
-// richiesta nell'header "x-sync-key" e confrontata con la variabile d'ambiente SYNC_SECRET
-// (impostata solo su Vercel, mai nel codice pubblico).
-const { kv } = require('@vercel/kv');
+'use strict';
 
-const EVENTS_KEY = 'theoreminder:events';
-// Tombstone delle eliminazioni { id: ISO }: senza, al prossimo merge un evento cancellato su un
-// dispositivo "risorgerebbe" perché lo salviamo ancora sugli altri (vedi merge in app.js).
-const DELETED_KEY = 'theoreminder:deleted';
-
-function isAuthorized(req) {
-  const provided = req.headers['x-sync-key'];
-  const expected = process.env.SYNC_SECRET;
-  return !!expected && provided === expected;
-}
+const { requireSyncKey } = require('../lib/auth');
+const store = require('../lib/store');
 
 module.exports = async function handler(req, res) {
-  if (!isAuthorized(req)) {
-    res.status(401).json({ error: 'Non autorizzato' });
-    return;
-  }
+  if (!requireSyncKey(req, res)) return;
 
-  if (req.method === 'GET') {
-    const events = (await kv.get(EVENTS_KEY)) || [];
-    const deleted = (await kv.get(DELETED_KEY)) || {};
-    res.status(200).json({ events, deleted });
-    return;
-  }
-
-  if (req.method === 'PUT') {
-    const body = req.body || {};
-    if (!Array.isArray(body.events)) {
-      res.status(400).json({ error: 'Corpo della richiesta non valido: atteso { events: [...] }' });
+  try {
+    if (req.method === 'GET') {
+      res.status(200).json(await store.getState());
       return;
     }
-    await kv.set(EVENTS_KEY, body.events);
-    // `deleted` è opzionale: un client vecchio (che non lo manda) non deve cancellare i tombstone.
-    if (body.deleted && typeof body.deleted === 'object' && !Array.isArray(body.deleted)) {
-      await kv.set(DELETED_KEY, body.deleted);
-    }
-    res.status(200).json({ ok: true });
-    return;
-  }
 
-  res.status(405).json({ error: 'Metodo non consentito' });
+    if (req.method === 'PUT') {
+      let body = req.body;
+      if (typeof body === 'string') {
+        try {
+          body = JSON.parse(body);
+        } catch (_) {
+          res.status(400).json({ error: 'JSON non valido' });
+          return;
+        }
+      }
+
+      let incoming;
+      try {
+        incoming = store.normalizeIncomingState(body);
+      } catch (_) {
+        res.status(400).json({ error: 'Corpo della richiesta non valido' });
+        return;
+      }
+      const state = await store.mergeState(incoming);
+      res.status(200).json(Object.assign({ ok: true }, state));
+      return;
+    }
+
+    res.status(405).json({ error: 'Metodo non consentito' });
+  } catch (_) {
+    res.status(500).json({ error: 'Errore interno di sincronizzazione' });
+  }
 };

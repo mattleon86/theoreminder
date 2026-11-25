@@ -6,5 +6,9 @@
   "dependencies": {
     "@vercel/kv": "^2.0.0",
     "web-push": "^3.6.7"
+  },
+  "scripts": {
+    "test": "node --test --test-force-exit",
+    "check": "node --check app.js && node --check boot.js && node --check sw.js && node --check shared/core.js && node --check lib/auth.js && node --check lib/store.js && node --check api/events.js && node --check api/send-reminders.js && node --check api/push-subscribe.js && node --check api/list-backups.js && node --check api/vapid-public-key.js && node --check api/cron-morning.js && node --check api/cron-evening.js"
   }
 }

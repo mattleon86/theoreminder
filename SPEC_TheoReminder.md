@@ -1,4 +1,6 @@
-# TheoReminder — Spec di progetto (per Claude Code)
+# TheoReminder — Specifica storica
+
+> **Documento archiviato.** Descrive la prima versione (GitHub Pages, solo localStorage, tema chiaro/scuro). Lo stato attuale è in `ISTRUZIONI.md` e `THEOREMINDER-COMPLETO.md`: Vercel + KV, notifiche push, sincronizzazione atomica, backup e solo tema chiaro.
 
 Agenda personale incarichi congregazione, utente singolo: **Matteo Piano**. Nessun login, nessun backend, budget zero.
 

@@ -66,6 +66,17 @@ p { margin: 0 0 8px; color: var(--muted); }
 
 svg { display: block; }
 .icon { width: 18px; height: 18px; flex: 0 0 auto; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 :focus-visible {
   outline: 2px solid var(--accent);
@@ -120,6 +131,16 @@ svg { display: block; }
   color: var(--muted);
   text-transform: capitalize;
   white-space: nowrap;
+}
+
+.connection-banner {
+  padding: 8px 18px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-bottom: 1px solid #ead9bb;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-align: center;
 }
 
 /* ---------- Contenuto ---------- */
@@ -273,6 +294,9 @@ main {
   background: transparent;
   box-shadow: none;
 }
+#upcoming-list .upcoming-card { cursor: pointer; }
+#upcoming-list .upcoming-card:hover { background: var(--accent-soft); }
+#upcoming-list .upcoming-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 #upcoming-list .card .badge {
   display: inline-block;
   font-size: 0.78rem;
@@ -331,6 +355,9 @@ button, .btn {
   transition: background-color 0.16s ease, border-color 0.16s ease, transform 0.12s ease;
 }
 button:active, .btn:active { transform: translateY(1px); }
+button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+.button-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+.button-row .btn { width: auto; max-width: 100%; }
 
 .btn-primary {
   display: inline-flex;
@@ -491,6 +518,16 @@ html.locked .lock-screen { display: flex; }
 .pdf-file-section { margin-bottom: 20px; }
 .pdf-file-section h4 { font-size: 0.9rem; margin: 0 0 8px; word-break: break-word; }
 .assignment-card { border-left: 3px solid var(--accent); }
+.confidence-badge {
+  display: inline-block;
+  padding: 3px 9px;
+  margin-bottom: 8px;
+  border-radius: 999px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
 .assignment-card .badge {
   display: inline-block;
   font-size: 0.7rem;
@@ -525,6 +562,8 @@ html.locked .lock-screen { display: flex; }
 }
 
 /* ---------- Calendario ---------- */
+.calendar-search-label { margin-top: 18px; }
+#calendar-search { max-width: 420px; margin-bottom: 12px; }
 #calendar {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -618,6 +657,8 @@ html.locked .lock-screen { display: flex; }
 /* ---------- Impostazioni ---------- */
 .setting-card p { font-size: 0.82rem; }
 .setting-card button:not(.btn-icon) { max-width: 320px; width: 100%; }
+.setting-card .button-row button { width: auto; }
+.setting-card input[type="file"] { max-width: 420px; font-size: 0.78rem; }
 .setting-danger { border-color: #edd7d3; }
 .app-footnote {
   text-align: center;

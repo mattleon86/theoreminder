@@ -1,42 +1,43 @@
-// Funzione serverless Vercel: consente di consultare/recuperare gli snapshot mensili degli
-// incarichi, in caso di emergenza (dati principali persi o corrotti).
-// - GET senza parametri  → elenco delle etichette dei backup disponibili (es. "2026-08")
-// - GET ?label=2026-08   → contenuto di quel backup ({ savedAt, events })
-// Il backup mensile viene creato da api/send-reminders.js (il primo giorno del mese, "a bordo"
-// del cron dei promemoria: il piano gratuito di Vercel permette solo 2 Cron per progetto).
-// Stessa autenticazione delle altre API (password del lucchetto == X-Sync-Key == SYNC_SECRET).
-const { kv } = require('@vercel/kv');
+'use strict';
 
-const BACKUP_PREFIX = 'theoreminder:events-backup:';
-const BACKUP_INDEX_KEY = 'theoreminder:events-backup-index';
-
-function isAuthorized(req) {
-  const provided = req.headers['x-sync-key'];
-  const expected = process.env.SYNC_SECRET;
-  return !!expected && provided === expected;
-}
+const { requireSyncKey } = require('../lib/auth');
+const store = require('../lib/store');
 
 module.exports = async function handler(req, res) {
-  if (!isAuthorized(req)) {
-    res.status(401).json({ error: 'Non autorizzato' });
-    return;
-  }
-  if (req.method !== 'GET') {
-    res.status(405).json({ error: 'Metodo non consentito' });
-    return;
-  }
+  if (!requireSyncKey(req, res)) return;
 
-  const label = req.query && req.query.label;
-  if (label) {
-    const backup = await kv.get(`${BACKUP_PREFIX}${label}`);
-    if (!backup) {
-      res.status(404).json({ error: 'Backup non trovato per questo mese' });
+  try {
+    if (req.method === 'GET') {
+      const label = req.query && req.query.label;
+      if (label !== undefined && label !== '' && !store.isValidBackupLabel(label)) {
+        res.status(400).json({ error: 'Etichetta backup non valida' });
+        return;
+      }
+      if (label) {
+        const backup = await store.getBackup(label);
+        if (!backup) {
+          res.status(404).json({ error: 'Backup non trovato' });
+          return;
+        }
+        res.status(200).json(backup);
+        return;
+      }
+
+      const labels = await store.backupLabels();
+      res.status(200).json({ backups: labels, lastBackup: await store.getLastBackupInfo(undefined, labels) });
       return;
     }
-    res.status(200).json(backup);
-    return;
-  }
 
-  const index = (await kv.get(BACKUP_INDEX_KEY)) || [];
-  res.status(200).json({ backups: index.slice().sort().reverse() });
+    if (req.method === 'POST') {
+      const state = await store.getState();
+      const created = await store.createBackup(state, store.manualBackupLabel(), 'manual');
+      const lastBackup = await store.getLastBackupInfo();
+      res.status(200).json({ ok: true, label: created.label, created: created.created, lastBackup });
+      return;
+    }
+
+    res.status(405).json({ error: 'Metodo non consentito' });
+  } catch (_) {
+    res.status(500).json({ error: 'Errore interno dei backup' });
+  }
 };
